@@ -275,7 +275,7 @@ impl eframe::App for DropshipApp {
             }
             if ui.checkbox(
                 &mut self.settings.acknowledged_cgroup,
-                "I understand: blocks apply only to Overwatch's process tree, and other applications are not affected.",
+                "I understand: blocks are scoped to Overwatch's process tree, not applied to the whole device.",
             ).changed() {
                 self.save_settings();
             }
