@@ -111,14 +111,17 @@ counter_for() {
     | awk '{ s += $2 } END { print s+0 }'
 }
 
-# nft re-parses the path string itself, so it needs *nft-level* quotes. Sent
-# unquoted, `user@1000.service` lexes as `user`, `@`, then a bare number, and
-# nft fails with "syntax error, unexpected number". Any path containing `@`
-# (i.e. every real Steam cgroup) must be quoted.
-add_scoped_counter() { # <level> <path> <comment>
+# The one place a cgroup-scoped rule is formatted. nft re-parses the path string
+# itself, so it needs *nft-level* quotes: sent unquoted, `user@1000.service`
+# lexes as `user`, `@`, then a bare number, and nft fails with "syntax error,
+# unexpected number". Every rule goes through here so no call site can build one
+# with an unquoted path — the drop rule was missed once already.
+add_scoped_rule() { # <level> <path> <comment> <counter|drop>
   as_root nft add rule inet "$TABLE" output \
-    socket cgroupv2 level "$1" "\"$2\"" counter comment "\"$3\""
+    socket cgroupv2 level "$1" "\"$2\"" "$4" comment "\"$3\""
 }
+add_scoped_counter() { add_scoped_rule "$1" "$2" "$3" counter; }
+add_scoped_drop() { add_scoped_rule "$1" "$2" "$3" drop; }
 
 # One packets value per ancestor level, space separated.
 read_levels() {
@@ -253,7 +256,8 @@ step "4. Install a counter at every ancestor level"
 info "a socket matches its own cgroup AND every ancestor, so the deepest"
 info "level that moves reveals where Proton's sockets actually live."
 info "caveat: levels at or above user@1000.service also carry Steam's own and"
-info "this SSH session's traffic, so only the game's own level is unambiguous."
+info "this SSH session's traffic. The game's own level is the most specific, but"
+info "it is not automatically Overwatch-only — step 6 tests whether it is shared."
 
 for level in $(seq 1 "$GAME_LEVEL"); do
   path=$(ancestor_of "$GAME_CGROUP" "$level")
@@ -308,11 +312,15 @@ for level in $(seq 1 "$GAME_LEVEL"); do
 done
 printf '\n'
 
-if [ "$(delta_at "$CLOSED" "$GAME_LEVEL")" -eq 0 ]; then
-  ok "the game's own level stayed flat with the game closed — it is game-specific."
+CLOSED_GAME=$(delta_at "$CLOSED" "$GAME_LEVEL")
+if [ "$CLOSED_GAME" -eq 0 ]; then
+  ok "the game's cgroup stayed flat with the game closed — it is game-specific."
+  info "this is the Game Mode shape: a per-launch app-<n>.scope holding only the game."
 else
-  warn "the game's own level still moved with the game closed. Its path embeds the"
-  warn "launcher PID, so nothing should match it — treat those numbers as suspect."
+  warn "the game's cgroup kept carrying traffic with the game closed (+$CLOSED_GAME)."
+  warn "It is SHARED with something else, so a rule scoped here is not Overwatch-only."
+  info "this is the Desktop Mode shape: the game sits in Steam's own"
+  info "app-steam@autostart.service, alongside the Steam client itself."
 fi
 
 # A level that moved while the game was closed is carrying someone else's
@@ -350,6 +358,11 @@ else
   NEW_CGROUP=$(cgroup_path_of "$NEW_PID")
   info "old PID $PID -> $GAME_CGROUP"
   info "new PID $NEW_PID -> $NEW_CGROUP"
+  if [ "$NEW_CGROUP" = "$GAME_CGROUP" ]; then
+    info "the path survived the relaunch: a stable scope, as in Desktop Mode"
+  else
+    info "the path changed with the PID: a per-launch scope, as in Game Mode"
+  fi
 
   before=$(counter_for "lvl-$BEST")
   pause "Play for ~30 seconds in this new session, then return."
@@ -357,14 +370,15 @@ else
   delta=$((after - before))
 
   if [ "$BEST" -eq "$GAME_LEVEL" ]; then
-    # The rule still pins the *old* launcher's scope, which the new instance
-    # cannot be in, so counting nothing is the expected and informative result.
     if [ "$delta" -eq 0 ]; then
-      ok "the old level-$BEST rule counted nothing after relaunch, as expected."
-      warn "the cgroup path is per-launch, so blocks MUST be re-applied after"
-      warn "every game launch. The re-apply prompt is load-bearing."
+      ok "the old level-$BEST rule counted nothing after relaunch."
+      warn "the scope is per-launch, so blocks MUST be re-applied after every launch."
+      info "the app's re-apply prompt is load-bearing in this mode."
     else
-      warn "the old rule counted +$delta — unexpected; the path may not be per-launch."
+      warn "the old level-$BEST rule still counted +$delta after relaunch."
+      info "The scope is stable across launches, so re-applying is not required here —"
+      info "but it is shared with Steam (step 6), so these rules are not Overwatch-only."
+      info "Both facts point at Desktop Mode."
     fi
   elif [ "$delta" -gt 0 ]; then
     ok "the level-$BEST ancestor rule kept counting (+$delta) after relaunch"
@@ -379,9 +393,12 @@ fi
 if [ "$DO_DROP" -eq 1 ] && [ "$BEST" -gt 0 ]; then
   step "8. Drop test (--drop)"
   DROP_PATH=$(ancestor_of "$GAME_CGROUP" "$BEST")
-  as_root nft add rule inet "$TABLE" output \
-    socket cgroupv2 level "$BEST" "$DROP_PATH" drop comment "drop-test" \
-    && ok "installed drop rule for level $BEST"
+  if err=$(add_scoped_drop "$BEST" "$DROP_PATH" "drop-test" 2>&1); then
+    ok "installed drop rule for level $BEST -> $DROP_PATH"
+  else
+    fail "nft rejected the drop rule"
+    info "    nft said: $err"
+  fi
   pause "Check in-game connectivity, and that a browser still reaches these regions."
   info "Remove it at any time with: sudo nft delete table inet $TABLE"
 fi
