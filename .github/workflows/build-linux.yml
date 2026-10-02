@@ -233,7 +233,9 @@ jobs:
           set -eu
           version=${GITHUB_REF_NAME#v}
           tarball=dropship-steamos-$version-linux-x86_64.tar.gz
-          notes=.github/release-notes/$version.md
+          # Keyed on the tag, not $version: the notes in the tree are named
+          # v0.1.0.md, while $version has the v stripped.
+          notes=.github/release-notes/$GITHUB_REF_NAME.md
 
           # A release with no written caveat is worse than no release: the whole
           # point of marking this a pre-release is naming which half of the
