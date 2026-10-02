@@ -116,8 +116,16 @@ jobs:
           version=${GITHUB_REF_NAME#v}
           stage=dropship-steamos-$version
 
-          test -x artifact/target/release/dropship-steamos
-          test -x artifact/target/release/dropship-steamos-helper
+          # -f, not -x, and this is not laziness. upload-artifact records the
+          # mode in the zip, but download-artifact does not restore it, so the
+          # binaries arrive non-executable. Requiring -x here failed the first
+          # release run in eleven milliseconds with no output at all. The exec
+          # bit is set by the install -m below regardless, so the artifact's is
+          # not worth asking about — but a future failure should not be silent,
+          # hence the listing.
+          ls -l artifact/target/release
+          test -f artifact/target/release/dropship-steamos
+          test -f artifact/target/release/dropship-steamos-helper
 
           mkdir -p "$stage/packaging" "$stage/assets/icons"
           # install(1), not cp: every mode is stated here rather than inherited
