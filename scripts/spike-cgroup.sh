@@ -10,7 +10,9 @@
 #   ./spike-cgroup.sh              # safe: counter rules only
 #   ./spike-cgroup.sh --drop       # adds a real drop rule for the game cgroup
 #
-# Run in Desktop Mode (Konsole), with Overwatch installed via Steam.
+# Run this over SSH from another machine while Overwatch runs in *Game Mode*:
+# switching the Deck to Desktop Mode closes the running game, and steps 2-7 all
+# need the game alive. The TTY comes from your SSH client, not from Konsole.
 
 set -uo pipefail
 
@@ -109,6 +111,37 @@ counter_for() {
     | awk '{ s += $2 } END { print s+0 }'
 }
 
+# nft re-parses the path string itself, so it needs *nft-level* quotes. Sent
+# unquoted, `user@1000.service` lexes as `user`, `@`, then a bare number, and
+# nft fails with "syntax error, unexpected number". Any path containing `@`
+# (i.e. every real Steam cgroup) must be quoted.
+add_scoped_counter() { # <level> <path> <comment>
+  as_root nft add rule inet "$TABLE" output \
+    socket cgroupv2 level "$1" "\"$2\"" counter comment "\"$3\""
+}
+
+# One packets value per ancestor level, space separated.
+read_levels() {
+  local level
+  for level in $(seq 1 "$GAME_LEVEL"); do counter_for "lvl-$level"; done | tr '\n' ' '
+}
+
+# Per-level deltas between two read_levels snapshots.
+level_deltas() { # <before> <after>
+  printf '%s\n%s\n' "$1" "$2" | awk '{
+    if (NR==1) { n = split($0, a, " ") }
+    else {
+      split($0, b, " ")
+      for (i=1;i<=n;i++) printf "%s%s", (i>1?" ":""), b[i]-a[i]
+      print ""
+    }
+  }'
+}
+
+delta_at() { # <deltas> <level>
+  printf '%s' "$1" | awk -v n="$2" '{ print $n+0 }'
+}
+
 # ------------------------------------------------------------------ 1. probe
 
 step "1. Environment probe"
@@ -146,11 +179,15 @@ CONFIG=""
 [ -r "/boot/config-$KERNEL" ] && CONFIG="/boot/config-$KERNEL"
 if [ -n "$CONFIG" ]; then
   for opt in CONFIG_NFT_SOCKET CONFIG_SOCK_CGROUP_DATA CONFIG_CGROUPS; do
-    if zgrep -q "^$opt=y" "$CONFIG" 2>/dev/null || grep -q "^$opt=y" "$CONFIG" 2>/dev/null; then
-      ok "$opt=y"
-    else
-      warn "$opt not confirmed in $CONFIG"
-    fi
+    # =m counts: nft_socket ships as a module and autoloads on first use, so
+    # only checking =y reports a false alarm on every stock Valve kernel.
+    val=$(zgrep -m1 "^$opt=" "$CONFIG" 2>/dev/null || grep -m1 "^$opt=" "$CONFIG" 2>/dev/null)
+    case "$val" in
+      *"=y") ok "$opt=y" ;;
+      *"=m") ok "$opt=m (module; autoloads when a socket rule is added)" ;;
+      "")    warn "$opt absent from $CONFIG" ;;
+      *)     warn "$opt disabled ($val)" ;;
+    esac
   done
 else
   warn "no kernel config available to inspect (CONFIG_NFT_SOCKET unverified)"
@@ -196,8 +233,7 @@ as_root nft delete table inet "$TABLE" 2>/dev/null
 as_root nft add table inet "$TABLE" || exit 1
 as_root nft add chain inet "$TABLE" output \
   '{ type filter hook output priority filter; policy accept; }' || exit 1
-as_root nft add rule inet "$TABLE" output \
-  socket cgroupv2 level "$SELF_LEVEL" "$SELF_CGROUP" counter comment "control" || exit 1
+add_scoped_counter "$SELF_LEVEL" "$SELF_CGROUP" "control" || exit 1
 
 # Generate a little outbound traffic from this shell.
 (curl -s -o /dev/null --max-time 5 https://example.com 2>/dev/null || true)
@@ -215,83 +251,133 @@ fi
 step "4. Install a counter at every ancestor level"
 
 info "a socket matches its own cgroup AND every ancestor, so the deepest"
-info "level that increments reveals where Proton's sockets actually live."
+info "level that moves reveals where Proton's sockets actually live."
+info "caveat: levels at or above user@1000.service also carry Steam's own and"
+info "this SSH session's traffic, so only the game's own level is unambiguous."
 
 for level in $(seq 1 "$GAME_LEVEL"); do
   path=$(ancestor_of "$GAME_CGROUP" "$level")
   [ -z "$path" ] && continue
-  if as_root nft add rule inet "$TABLE" output \
-      socket cgroupv2 level "$level" "$path" counter comment "lvl-$level" 2>/dev/null; then
+  if err=$(add_scoped_counter "$level" "$path" "lvl-$level" 2>&1); then
     info "level $level -> $path"
   else
-    fail "level $level -> $path (nft rejected this ancestor)"
+    fail "level $level -> $path"
+    info "    nft said: $err"
   fi
 done
 
-pause "Now play or sit in an Overwatch match for ~30 seconds, then come back."
+# ------------------------------------------------------ 5. game-running window
 
-step "5. Results"
-BEST=0
+step "5. Game running: per-level deltas"
+
+BEFORE=$(read_levels)
+pause "Get into an Overwatch match (or the practice range) for ~30 seconds, then come back."
+AFTER=$(read_levels)
+RUNNING=$(level_deltas "$BEFORE" "$AFTER")
+
 for level in $(seq 1 "$GAME_LEVEL"); do
-  packets=$(counter_for "lvl-$level")
-  path=$(ancestor_of "$GAME_CGROUP" "$level")
-  if [ "$packets" -gt 0 ]; then
-    ok "level $level: $packets packets   $path"
-    BEST=$level
-  else
-    info "level $level: 0 packets       $path"
-  fi
+  info "level $level: +$(delta_at "$RUNNING" "$level") packets   $(ancestor_of "$GAME_CGROUP" "$level")"
 done
 
+GAME_DELTA=$(delta_at "$RUNNING" "$GAME_LEVEL")
 printf '\n'
-if [ "$BEST" -eq 0 ]; then
-  fail "No ancestor level matched the game's traffic."
-  warn "Sockets are not inheriting this process's cgroup, or the game was idle."
-  warn "Re-run while a match is actually in progress before concluding anything."
-elif [ "$BEST" -eq "$GAME_LEVEL" ]; then
-  ok "Sockets live in the game's own cgroup (level $BEST)."
-  info "The design works as implemented: discover the PID's cgroup and match it."
+if [ "$GAME_DELTA" -gt 0 ]; then
+  ok "the game's OWN cgroup (level $GAME_LEVEL) moved: +$GAME_DELTA packets."
+  info "Sockets inherit the game's cgroup, so matching its exact path is correct —"
+  info "which is what the app already does."
 else
-  warn "Sockets live at level $BEST, ABOVE the game's own cgroup (level $GAME_LEVEL)."
-  warn "Matching the game's exact path would miss them; match this ancestor instead:"
-  warn "    socket cgroupv2 level $BEST \"$(ancestor_of "$GAME_CGROUP" "$BEST")\""
-  info "This is the finding that changes the implementation."
+  fail "the game's own cgroup (level $GAME_LEVEL) did not move."
+  warn "Either the game was idle, or its sockets live at a higher level."
+  warn "Step 6 separates the two: a level carrying other traffic keeps counting"
+  warn "after the game closes, while the game's own level cannot."
 fi
 
-# --------------------------------------------------------- 6. relaunch test
+# ------------------------------------------------------ 6. game-closed control
 
-pause "Step 6: fully QUIT Overwatch (back to the Steam UI), relaunch it, and re-enter a match."
+pause "Step 6: fully QUIT Overwatch back to the Steam UI, then press Enter."
+
+CLOSED_BEFORE=$(read_levels)
+info "measuring 20s with the game closed…"
+sleep 20
+CLOSED_AFTER=$(read_levels)
+CLOSED=$(level_deltas "$CLOSED_BEFORE" "$CLOSED_AFTER")
+
+printf '\n'
+for level in $(seq 1 "$GAME_LEVEL"); do
+  info "level $level: +$(delta_at "$CLOSED" "$level") packets with the game closed"
+done
+printf '\n'
+
+if [ "$(delta_at "$CLOSED" "$GAME_LEVEL")" -eq 0 ]; then
+  ok "the game's own level stayed flat with the game closed — it is game-specific."
+else
+  warn "the game's own level still moved with the game closed. Its path embeds the"
+  warn "launcher PID, so nothing should match it — treat those numbers as suspect."
+fi
+
+# A level that moved while the game was closed is carrying someone else's
+# traffic (Steam, gamescope, this SSH session), so it cannot be attributed.
+BEST=0
+if [ "$GAME_DELTA" -gt 0 ]; then
+  BEST=$GAME_LEVEL
+else
+  for level in $(seq 1 "$GAME_LEVEL"); do
+    [ "$(delta_at "$CLOSED" "$level")" -eq 0 ] || continue
+    [ "$(delta_at "$RUNNING" "$level")" -gt 0 ] || continue
+    BEST=$level
+  done
+  if [ "$BEST" -gt 0 ]; then
+    ok "level $BEST moved only while the game was running: $(ancestor_of "$GAME_CGROUP" "$BEST")"
+    warn "matching the game's own level would miss those — match this ancestor instead."
+  else
+    fail "no level can be attributed to the game. Re-run during an active match."
+  fi
+fi
+
+# ------------------------------------------------------------ 7. relaunch test
+
+pause "Step 7: relaunch Overwatch, get back into a match, then press Enter."
 
 NEW_PID=$(game_pid)
 if [ -z "$NEW_PID" ]; then
   warn "Overwatch is not running — skipping the relaunch test"
+elif [ "$NEW_PID" = "$PID" ]; then
+  fail "the PID is still $PID — the game was not actually relaunched."
+  warn "skipping the relaunch test rather than reporting a false result."
+elif [ "$BEST" -eq 0 ]; then
+  warn "no attributable level to test — skipping the relaunch test"
 else
   NEW_CGROUP=$(cgroup_path_of "$NEW_PID")
-  info "new PID $NEW_PID, cgroup: $NEW_CGROUP"
-  if [ "$NEW_CGROUP" = "$GAME_CGROUP" ]; then
-    info "cgroup path is unchanged across the relaunch"
-  else
-    warn "cgroup path CHANGED across the relaunch"
-  fi
+  info "old PID $PID -> $GAME_CGROUP"
+  info "new PID $NEW_PID -> $NEW_CGROUP"
 
-  if [ "$BEST" -gt 0 ]; then
-    before=$(counter_for "lvl-$BEST")
-    pause "Play for ~30 seconds in this new session, then return."
-    after=$(counter_for "lvl-$BEST")
-    if [ "$after" -gt "$before" ]; then
-      ok "the level-$BEST rule still counted packets after relaunch (+$((after - before)))"
-      info "rules survive relaunches — the re-apply prompt may be unnecessary"
+  before=$(counter_for "lvl-$BEST")
+  pause "Play for ~30 seconds in this new session, then return."
+  after=$(counter_for "lvl-$BEST")
+  delta=$((after - before))
+
+  if [ "$BEST" -eq "$GAME_LEVEL" ]; then
+    # The rule still pins the *old* launcher's scope, which the new instance
+    # cannot be in, so counting nothing is the expected and informative result.
+    if [ "$delta" -eq 0 ]; then
+      ok "the old level-$BEST rule counted nothing after relaunch, as expected."
+      warn "the cgroup path is per-launch, so blocks MUST be re-applied after"
+      warn "every game launch. The re-apply prompt is load-bearing."
     else
-      fail "the level-$BEST rule counted nothing new after relaunch"
-      warn "re-applying on every game launch IS required, as assumed"
+      warn "the old rule counted +$delta — unexpected; the path may not be per-launch."
     fi
+  elif [ "$delta" -gt 0 ]; then
+    ok "the level-$BEST ancestor rule kept counting (+$delta) after relaunch"
+    info "an ancestor scope survives relaunches; an exact-scope match would not"
+  else
+    warn "the level-$BEST rule counted nothing new after relaunch"
   fi
 fi
 
 # ------------------------------------------------------------ 7. optional drop
 
 if [ "$DO_DROP" -eq 1 ] && [ "$BEST" -gt 0 ]; then
-  step "7. Drop test (--drop)"
+  step "8. Drop test (--drop)"
   DROP_PATH=$(ancestor_of "$GAME_CGROUP" "$BEST")
   as_root nft add rule inet "$TABLE" output \
     socket cgroupv2 level "$BEST" "$DROP_PATH" drop comment "drop-test" \
