@@ -10,7 +10,7 @@ pub struct Settings {
     #[serde(default)]
     pub blocked_server_tokens: BTreeSet<String>,
     #[serde(default)]
-    pub acknowledged_global_mvp: bool,
+    pub acknowledged_cgroup: bool,
 }
 
 fn default_steam_app_id() -> u32 {

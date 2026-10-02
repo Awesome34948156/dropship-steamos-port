@@ -2,16 +2,21 @@ use std::{
     io::Write,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
 };
 
 use eframe::egui;
 
 use crate::{
     catalogue::{self, Catalogue},
-    firewall::RulePlan,
+    firewall::{self, RulePlan},
     settings::{self, Settings},
     steam,
 };
+
+/// How often the running-game check is repeated so a newly launched Overwatch
+/// is noticed without the user clicking anything.
+const STEAM_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct DropshipApp {
     settings: Settings,
@@ -20,6 +25,10 @@ pub struct DropshipApp {
     steam: steam::SteamInstall,
     status: String,
     show_rule_preview: bool,
+    /// The cgroup the currently loaded rules were scoped to, so a relaunch of
+    /// the game can be detected and the user told to re-apply.
+    last_applied: Option<firewall::CgroupMatch>,
+    last_steam_poll: Instant,
 }
 
 impl DropshipApp {
@@ -36,6 +45,8 @@ impl DropshipApp {
             steam,
             status: "Loading the current server catalogue…".to_owned(),
             show_rule_preview: false,
+            last_applied: None,
+            last_steam_poll: Instant::now(),
         };
         app.refresh_catalogue();
         app
@@ -75,6 +86,16 @@ impl DropshipApp {
         }
     }
 
+    fn poll_steam(&mut self, ctx: &egui::Context) {
+        if self.last_steam_poll.elapsed() < STEAM_POLL_INTERVAL {
+            ctx.request_repaint_after(STEAM_POLL_INTERVAL - self.last_steam_poll.elapsed());
+            return;
+        }
+        self.steam = steam::discover(self.settings.steam_app_id);
+        self.last_steam_poll = Instant::now();
+        ctx.request_repaint_after(STEAM_POLL_INTERVAL);
+    }
+
     fn save_settings(&mut self) {
         if let Err(error) = settings::save(&self.settings) {
             self.status = format!("Could not save settings: {error}");
@@ -86,10 +107,13 @@ impl DropshipApp {
             .catalogue
             .as_ref()
             .ok_or("The catalogue is not loaded yet")?;
+        let cgroup = self.steam.cgroup.clone().ok_or(
+            "Start Overwatch first: blocks are scoped to its process tree, which only exists while it runs.",
+        )?;
         let networks =
             catalogue::selected_networks(catalogue, &self.settings.blocked_server_tokens)
                 .map_err(|error| error.to_string())?;
-        Ok(RulePlan::from_networks(networks))
+        Ok(RulePlan::from_networks(networks, cgroup))
     }
 
     fn run_helper(&mut self, action: &str, plan: Option<&RulePlan>) {
@@ -130,10 +154,13 @@ impl DropshipApp {
 
         self.status = match result {
             Ok(()) if action == "apply" => {
-                "Firewall rules applied. They are global in this MVP; use Disable to remove them."
-                    .to_owned()
+                self.last_applied = plan.map(|plan| plan.cgroup.clone());
+                "Blocks applied to Overwatch only. Other applications are unaffected.".to_owned()
             }
-            Ok(()) => "All Dropship SteamOS firewall rules were removed.".to_owned(),
+            Ok(()) => {
+                self.last_applied = None;
+                "All Dropship SteamOS firewall rules were removed.".to_owned()
+            }
             Err(error) => error,
         };
     }
@@ -142,8 +169,9 @@ impl DropshipApp {
 impl eframe::App for DropshipApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_catalogue();
+        self.poll_steam(ctx);
         if self.catalogue_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -157,6 +185,7 @@ impl eframe::App for DropshipApp {
                 }
                 if ui.button("Refresh Steam status").clicked() {
                     self.steam = steam::discover(self.settings.steam_app_id);
+                    self.last_steam_poll = Instant::now();
                 }
                 ui.label(&self.status);
             });
@@ -173,11 +202,44 @@ impl eframe::App for DropshipApp {
                     self.settings.steam_app_id = app_id;
                     self.save_settings();
                     self.steam = steam::discover(app_id);
+                    self.last_steam_poll = Instant::now();
                 }
             });
             ui.label(steam::steam_library_hint(&self.steam));
-            if self.steam.game_running {
-                ui.colored_label(egui::Color32::YELLOW, "Overwatch appears to be running. Apply is disabled until it closes.");
+
+            match (&self.steam.cgroup, self.steam.game_running()) {
+                (Some(cgroup), _) => {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_GREEN,
+                        "Overwatch is running. Blocks will be scoped to its process tree.",
+                    );
+                    ui.label(format!("Process tree: {}", cgroup.path));
+                }
+                (None, true) => {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Overwatch is running, but its cgroup could not be read, so Apply stays disabled.",
+                    );
+                }
+                (None, false) => {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Start Overwatch to enable Apply. Dropship only scopes blocks to Overwatch's process tree and never blocks the whole device.",
+                    );
+                }
+            }
+
+            // Only warn while the game is actually running in a *different*
+            // cgroup. A game that has simply exited is not a stale rule yet.
+            let stale = self
+                .last_applied
+                .as_ref()
+                .is_some_and(|applied| self.steam.cgroup.as_ref().is_some_and(|live| live != applied));
+            if stale {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Overwatch restarted — the existing blocks no longer match. Click Apply blocks again to re-scope them.",
+                );
             }
 
             ui.separator();
@@ -203,12 +265,17 @@ impl eframe::App for DropshipApp {
             if selection_changed { self.save_settings(); }
 
             let plan = self.plan();
-            if let Ok(plan) = &plan {
-                ui.label(format!("Selected ranges: {} IPv4, {} IPv6", plan.ipv4.len(), plan.ipv6.len()));
+            match &plan {
+                Ok(plan) => {
+                    ui.label(format!("Selected ranges: {} IPv4, {} IPv6", plan.ipv4.len(), plan.ipv6.len()));
+                }
+                Err(reason) => {
+                    ui.colored_label(egui::Color32::GRAY, reason.as_str());
+                }
             }
             if ui.checkbox(
-                &mut self.settings.acknowledged_global_mvp,
-                "I understand: this MVP blocks these destinations for the whole device, not only Overwatch.",
+                &mut self.settings.acknowledged_cgroup,
+                "I understand: blocks apply only to Overwatch's process tree, and other applications are not affected.",
             ).changed() {
                 self.save_settings();
             }
@@ -217,11 +284,12 @@ impl eframe::App for DropshipApp {
                 if ui.button("Preview nftables rules").clicked() {
                     self.show_rule_preview = !self.show_rule_preview;
                 }
-                let can_apply = self.settings.acknowledged_global_mvp
-                    && !self.steam.game_running
-                    && plan.as_ref().is_ok_and(|plan| !plan.ipv4.is_empty() || !plan.ipv6.is_empty());
-                if ui.add_enabled(can_apply, egui::Button::new("Apply blocks")).clicked() {
-                    if let Ok(plan) = &plan { self.run_helper("apply", Some(plan)); }
+                let can_apply = self.settings.acknowledged_cgroup
+                    && plan.as_ref().is_ok_and(|plan| !plan.is_empty());
+                if ui.add_enabled(can_apply, egui::Button::new("Apply blocks")).clicked()
+                    && let Ok(plan) = &plan
+                {
+                    self.run_helper("apply", Some(plan));
                 }
                 if ui.button("Disable all Dropship blocks").clicked() {
                     self.run_helper("disable", None);
