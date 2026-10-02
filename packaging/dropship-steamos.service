@@ -34,8 +34,8 @@ Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
 # If the service starts but never applies rules, check
 # `journalctl -u dropship-steamos`, then try commenting out the block below and
 # running `systemctl daemon-reload && systemctl restart dropship-steamos`.
-# The feature itself only needs: read /proc, read /sys/fs/cgroup, fork nft, and
-# write /run/dropship-steamos.
+# The feature itself needs: read the config, read /proc, read /sys/fs/cgroup,
+# fork nft, and write /run/dropship-steamos.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -47,8 +47,30 @@ ProtectClock=yes
 RestrictNamespaces=yes
 RestrictAddressFamilies=AF_NETLINK AF_UNIX
 LockPersonality=yes
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+# Two capabilities, each the narrowest one that does its job.
+#
+#   CAP_NET_ADMIN       — create and remove the nftables table.
+#   CAP_DAC_READ_SEARCH — read the config file. It lives under /home/deck, which
+#     is mode 0700, so reaching it means traversing a directory this process does
+#     not own. Root normally bypasses that check; a process held to a bounding
+#     set does not. Without this the watcher cannot even stat its own config — it
+#     logs "Permission denied" once and then idles forever, which is
+#     indistinguishable from "no game is running". Measured on the Deck
+#     2026-10-02: /home/deck is 0700 and this was the whole failure.
+#
+# Note what is deliberately absent. Reading /proc/<pid>/cmdline for another
+# user's process looks like it ought to need CAP_SYS_PTRACE, and that was the
+# first guess. Measured on the Deck the same day: it does not — `deck` can read
+# root's own /proc/1/cmdline — so adding it would have been pure widening.
+#
+# CAP_DAC_READ_SEARCH is the one real cost here: the daemon can now read files it
+# does not own. It never prints file contents, so the reachable harm is a parse
+# error in the journal rather than a disclosure — but it is a genuine widening,
+# and the reason to keep this list at two. The alternative, moving the config
+# where root can reach it without the capability, means changing the installer,
+# the GUI and the docs, and belongs in its own change rather than in a bug fix.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
 
 # systemd creates and owns this, and removes it when the service stops. The
 # mode is what lets the unprivileged GUI read the published state.
