@@ -24,6 +24,8 @@ That installs a small watcher service and a launcher entry. Open **Dropship for 
 
 **Why this is safe without a password prompt.** The privileged side decides what to build. The GUI writes only *which networks* to block, into `~/.config/dropship-steamos/service.json`; the service never reads a cgroup from that file, deriving it instead from the live game process. The helper is installed root-owned in a root-owned directory, so the desktop user cannot replace what root will execute. That combination is what a passwordless-polkit design would not have given you.
 
+**How long it takes.** The rules go up within about ten seconds of a launch, and come down about ten seconds after a quit. While nothing is running the watcher polls lazily, once every ten seconds, because the only thing it is waiting for is a launch and a match takes far longer than that to load — so the delay costs you nothing you would notice. Once it has rules up it polls every two seconds, which is what makes switching the toggle off feel immediate. The ten-second wait *after* a quit is deliberate: a crash and relaunch should not tear the rules down and rebuild them for nothing.
+
 Two consequences worth knowing:
 
 - **Blocked ranges are as fresh as the last time you opened the app.** The service deliberately never touches the network, so it cannot refresh the catalogue on its own. Everything it needs is resolved by the GUI and written to that file.
