@@ -5,6 +5,10 @@
 #   sudo packaging/install.sh
 #   sudo packaging/install.sh --uninstall
 #
+# That is the path from a git checkout. From a downloaded release tarball, use
+# the ./install.sh beside the binaries instead: it points this script at them and
+# then does exactly what follows, so there is one installer, not two.
+#
 # Safe to run again: it is how you repair an install after a SteamOS update.
 #
 # Why a service rather than a passwordless polkit rule: the privileged side
@@ -31,10 +35,40 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run this with sudo: sudo $0 $*"
 
-REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-HELPER_SRC=${DROPSHIP_HELPER:-$REPO/target/release/dropship-steamos-helper}
-GUI_SRC=${DROPSHIP_GUI:-$REPO/target/release/dropship-steamos}
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+
+# Two spellings, deliberately. The documented names are the DROPSHIP_STEAMOS_*
+# pair, which run.sh and the installed launcher entry also read; this script was
+# written against the shorter DROPSHIP_HELPER/DROPSHIP_GUI and shipped that way.
+# Accepting both costs one line and removes a trap that is otherwise invisible:
+# follow the README, set DROPSHIP_STEAMOS_HELPER, and watch nothing happen. When
+# both are set the documented pair wins.
+HELPER_SRC=${DROPSHIP_STEAMOS_HELPER:-${DROPSHIP_HELPER:-$REPO/target/release/dropship-steamos-helper}}
+GUI_SRC=${DROPSHIP_STEAMOS_GUI:-${DROPSHIP_GUI:-$REPO/target/release/dropship-steamos}}
 ICON_SRC=$REPO/assets/icons/game-icon-overwatch.svg
+
+# Every input is checked before anything is written. A release is the whole set
+# or it is broken: a download that did not extract fully, an override pointing
+# at a directory that was never built. Catching that halfway through would mean
+# /etc and /var/lib had already been touched, and the closing message could
+# promise a launcher entry that was never created. Checking here fails in the
+# first second, before systemd has heard of any of it.
+require_inputs() {
+    bad=
+    for f in "$HELPER_SRC" "$GUI_SRC"; do
+        [ -x "$f" ] || bad="$bad
+  $f (not executable)"
+    done
+    for f in "$ICON_SRC" "$REPO/packaging/$UNIT" "$REPO/packaging/dropship-steamos.desktop"; do
+        [ -f "$f" ] || bad="$bad
+  $f (missing)"
+    done
+    [ -z "$bad" ] || die "the install is incomplete:$bad
+
+This usually means the download did not extract fully, or DROPSHIP_STEAMOS_HELPER
+and DROPSHIP_STEAMOS_GUI point at a directory that was never built. From a
+checkout, build both with 'cargo build --release'."
+}
 
 # The desktop user owns the GUI and the config; root only owns the helper.
 detect_desktop_user() {
@@ -71,7 +105,6 @@ which turns off dm-verity for the whole system."
 }
 
 install_service() {
-    [ -x "$HELPER_SRC" ] || die "helper not found at $HELPER_SRC; build it with 'cargo build --release' or set DROPSHIP_HELPER"
     probe_writable
 
     say "Installing the privileged helper into $LIB_DIR"
@@ -91,18 +124,20 @@ install_service() {
 }
 
 install_launcher() {
-    if [ ! -x "$GUI_SRC" ]; then
-        say "Skipping the launcher entry: no GUI binary at $GUI_SRC"
-        return
-    fi
-
     gui_dir=$DESKTOP_HOME/.local/lib/dropship-steamos
     apps_dir=$DESKTOP_HOME/.local/share/applications
     say "Installing the app for $DESKTOP_USER into $gui_dir"
     install -d -o "$DESKTOP_USER" -g "$DESKTOP_GROUP" -m 0755 "$gui_dir"
     install -o "$DESKTOP_USER" -g "$DESKTOP_GROUP" -m 0755 "$GUI_SRC" \
         "$gui_dir/dropship-steamos"
-    [ -f "$ICON_SRC" ] && install -o "$DESKTOP_USER" -g "$DESKTOP_GROUP" -m 0644 \
+
+    # Unconditional, because require_inputs has already established the file is
+    # there. The original copy was guarded with `[ -f ]`, so a missing icon left
+    # the .desktop below pointing Icon= at a path that did not exist: a launcher
+    # entry with a blank icon and no error printed anywhere, indistinguishable
+    # from "this app has no icon by design". Two commits in this repo's history
+    # are that exact bug.
+    install -o "$DESKTOP_USER" -g "$DESKTOP_GROUP" -m 0644 \
         "$ICON_SRC" "$gui_dir/game-icon-overwatch.svg"
 
     # Written as the desktop user, not as root: a root-owned file inside the
@@ -125,6 +160,9 @@ report() {
         say "WARNING: $UNIT is not running. See: journalctl -u $UNIT -n 40"
     fi
     say ""
+    # Safe to say unconditionally: require_inputs has already refused to install
+    # at all if the GUI, the unit template, the icon or the launcher template was
+    # absent, so by here the entry this names definitely exists.
     say "Next:"
     say "  1. Open 'Dropship for SteamOS' from the application launcher."
     say "  2. Select regions, then switch on 'Block while Overwatch runs'."
@@ -162,6 +200,7 @@ case "${1:-}" in
         say "Any rules still installed can be cleared with: sudo nft delete table inet dropship_steamos"
         ;;
     "")
+        require_inputs
         install_service
         install_launcher
         report
