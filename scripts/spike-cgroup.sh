@@ -8,7 +8,7 @@
 #
 # Usage:
 #   ./spike-cgroup.sh              # safe: counter rules only
-#   ./spike-cgroup.sh --drop       # adds a real drop rule for the game cgroup
+#   ./spike-cgroup.sh --drop       # also proves a scoped drop actually cuts traffic
 #
 # Run this over SSH from another machine while Overwatch runs in *Game Mode*:
 # switching the Deck to Desktop Mode closes the running game, and steps 2-7 all
@@ -116,12 +116,32 @@ counter_for() {
 # lexes as `user`, `@`, then a bare number, and nft fails with "syntax error,
 # unexpected number". Every rule goes through here so no call site can build one
 # with an unquoted path — the drop rule was missed once already.
-add_scoped_rule() { # <level> <path> <comment> <counter|drop>
+add_scoped_rule() { # <level> <path> <comment> <counter|drop> [extra match…]
   as_root nft add rule inet "$TABLE" output \
-    socket cgroupv2 level "$1" "\"$2\"" "$4" comment "\"$3\""
+    socket cgroupv2 level "$1" "\"$2\"" "${@:5}" "$4" comment "\"$3\""
 }
-add_scoped_counter() { add_scoped_rule "$1" "$2" "$3" counter; }
-add_scoped_drop() { add_scoped_rule "$1" "$2" "$3" drop; }
+add_scoped_counter() { add_scoped_rule "$1" "$2" "$3" counter "${@:4}"; }
+add_scoped_drop() { add_scoped_rule "$1" "$2" "$3" drop "${@:4}"; }
+
+# HTTP status code seen by a curl running *inside* the given cgroup, or empty if
+# the process could not be moved there at all.
+#
+# The probe moves itself into the cgroup and only then execs curl. Doing it the
+# other way round — background a curl and write its PID into cgroup.procs —
+# races the fork: the shell spawns curl immediately, so curl may open its socket
+# in the parent's cgroup and the rule would miss it. nft matches the cgroup the
+# socket was created in, so the move has to land before the first connect.
+probe_in_cgroup() { # <cgroup path> <ip>
+  local probe
+  probe=$(mktemp) || return 1
+  cat > "$probe" <<'EOS'
+#!/bin/sh
+echo $$ > "/sys/fs/cgroup/$1/cgroup.procs" || exit 3
+exec curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$2"
+EOS
+  as_root sh "$probe" "$1" "$2" 2>/dev/null
+  rm -f "$probe"
+}
 
 # One packets value per ancestor level, space separated.
 read_levels() {
@@ -392,15 +412,70 @@ fi
 
 if [ "$DO_DROP" -eq 1 ] && [ "$BEST" -gt 0 ]; then
   step "8. Drop test (--drop)"
+
   DROP_PATH=$(ancestor_of "$GAME_CGROUP" "$BEST")
-  if err=$(add_scoped_drop "$BEST" "$DROP_PATH" "drop-test" 2>&1); then
-    ok "installed drop rule for level $BEST -> $DROP_PATH"
+  TEST_IP=1.1.1.1
+
+  info "the rule drops one benign destination ($TEST_IP) from level $BEST only."
+  info "a single destination proves scoping without disturbing the game's own"
+  info "connections, and the IP literal means no DNS lookup is involved."
+  printf '\n'
+
+  # A/B, because a blocked reading on its own proves nothing: an unreachable
+  # destination, a failed cgroup move and a working drop rule all look alike.
+  # The before-reading is what makes the after-reading mean anything.
+  BEFORE_PROBE=$(probe_in_cgroup "$GAME_CGROUP" "$TEST_IP")
+  BEFORE_OK=0
+  if [ -z "$BEFORE_PROBE" ]; then
+    fail "the probe could not join $GAME_CGROUP — nothing can be tested"
+    info "moving an outside process into a systemd scope can be refused"
+  elif [ "$BEFORE_PROBE" = "000" ]; then
+    warn "in-cgroup probe could not reach $TEST_IP even before the rule (HTTP 000)"
+    warn "so the result below cannot be attributed to the drop rule"
+  else
+    ok "in-cgroup probe reaches $TEST_IP unblocked (HTTP $BEFORE_PROBE)"
+    BEFORE_OK=1
+  fi
+
+  if err=$(add_scoped_drop "$BEST" "$DROP_PATH" "drop-test" \
+             "ip daddr $TEST_IP" 2>&1); then
+    ok "installed drop rule: level $BEST -> $DROP_PATH, daddr $TEST_IP"
   else
     fail "nft rejected the drop rule"
     info "    nft said: $err"
+    BEFORE_OK=0
   fi
-  pause "Check in-game connectivity, and that a browser still reaches these regions."
-  info "Remove it at any time with: sudo nft delete table inet $TABLE"
+
+  AFTER_PROBE=$(probe_in_cgroup "$GAME_CGROUP" "$TEST_IP")
+  CONTROL_PROBE=$(curl -s -o /dev/null -m 5 -w '%{http_code}' \
+    "http://$TEST_IP" 2>/dev/null)
+
+  printf '\n'
+  if [ "$BEFORE_OK" -eq 1 ]; then
+    case "$AFTER_PROBE" in
+      ""|000)
+        ok "the same probe is now blocked (HTTP ${AFTER_PROBE:-could not rejoin})"
+        ok "a cgroup-scoped drop rule cuts traffic from inside the game's cgroup"
+        ;;
+      *)
+        fail "the probe still reached $TEST_IP (HTTP $AFTER_PROBE) after the drop rule"
+        warn "the rule did not match; inspect it with: sudo nft list table inet $TABLE"
+        ;;
+    esac
+  else
+    warn "no usable before-reading, so the drop result above is inconclusive"
+  fi
+
+  if [ "$CONTROL_PROBE" = "000" ]; then
+    fail "this SSH session is ALSO blocked from $TEST_IP — the rule is not scoped"
+  else
+    ok "this SSH session still reaches $TEST_IP (HTTP $CONTROL_PROBE)"
+    info "a different cgroup is unaffected — the scope holds"
+  fi
+
+  printf '\n'
+  pause "Confirm in-game: Overwatch should be unaffected, since only $TEST_IP was dropped."
+  info "Remove the table at any time with: sudo nft delete table inet $TABLE"
 fi
 
 step "Done"
