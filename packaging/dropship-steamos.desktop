@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Dropship for SteamOS
+GenericName=Overwatch 2 server blocker
+Comment=Choose which Overwatch 2 server regions to block
+Categories=Game;Utility;Network;
+
+# DROPSHIP_STEAMOS_HELPER only matters for the manual path — with the watcher
+# service running, the window never shells out at all. Keeping it here means a
+# launcher-started instance also works before the service is installed.
+Exec=env DROPSHIP_STEAMOS_HELPER=@HELPER@ @GUI@
+Icon=@ICON@
+Terminal=false
+StartupNotify=false

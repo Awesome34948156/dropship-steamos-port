@@ -1,0 +1,59 @@
+[Unit]
+Description=Dropship for SteamOS — cgroup-scoped Overwatch 2 region blocks
+Documentation=https://github.com/stowmyy/dropship
+
+# nftables is not a service on SteamOS, but naming it costs nothing and is
+# correct where it does exist. The watcher tolerates nft being unavailable: it
+# logs and retries rather than exiting.
+After=network.target nftables.service
+Wants=nftables.service
+
+[Service]
+Type=simple
+# The config path is substituted by packaging/install.sh. It must be absolute:
+# this runs as root, where $HOME is /root and a relative path means something
+# else entirely.
+ExecStart=/var/lib/dropship-steamos/dropship-steamos-helper watch --config @CONFIG@
+
+# ExecStopPost, not ExecStop. ExecStop runs while the watcher is still alive, so
+# it could re-apply the rules in the window before it is killed, stranding drop
+# rules with nothing left running to remove them. ExecStopPost runs after the
+# process is gone, which is the only point at which "removed" stays removed.
+ExecStopPost=/var/lib/dropship-steamos/dropship-steamos-helper disable
+
+Restart=on-failure
+RestartSec=5s
+
+# firewall.rs resolves `nft` through PATH. That lookup now happens as root, from
+# a unit whose environment is not a login shell's, so it is pinned rather than
+# inherited.
+Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
+
+# --- Sandboxing -------------------------------------------------------------
+# These are defence in depth and are the lines most likely to need relaxing.
+# If the service starts but never applies rules, check
+# `journalctl -u dropship-steamos`, then try commenting out the block below and
+# running `systemctl daemon-reload && systemctl restart dropship-steamos`.
+# The feature itself only needs: read /proc, read /sys/fs/cgroup, fork nft, and
+# write /run/dropship-steamos.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+# systemd creates and owns this, and removes it when the service stops. The
+# mode is what lets the unprivileged GUI read the published state.
+RuntimeDirectory=dropship-steamos
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

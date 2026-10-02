@@ -102,7 +102,7 @@ impl CgroupMatch {
 /// Measured on the Deck 2026-10-02: a rule scoped to a scratch cgroup blocked
 /// traffic from that cgroup; after `rmdir` and `mkdir` at the same path (inode
 /// 31366 → 31422) the identical traffic went through. Hence the inode.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ScopedCgroup {
     pub cgroup: CgroupMatch,
     /// Inode of `/sys/fs/cgroup/<path>` when it was read.
@@ -148,7 +148,7 @@ fn cgroup_inode(_path: &str) -> Option<u64> {
     None
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RulePlan {
     /// Mandatory: a plan without a cgroup would block the whole device, so it
     /// cannot be represented. There is deliberately no `global()` constructor
@@ -269,15 +269,17 @@ fn listing_names_table(stdout: &str) -> bool {
     })
 }
 
-/// Remove the Dropship table, if it is there.
+/// Whether the Dropship table exists right now.
 ///
-/// Look before acting, and treat "there is nothing to remove" and "I could not
-/// find out" as different answers. The caller surfaces success to the user as
-/// "the rules are gone", so an unreadable state — not root, no nftables, no
-/// `nf_tables` in the kernel — has to fail loudly rather than report a removal
-/// that never happened. A missing table is the one case that is legitimately a
-/// success: it is already disabled.
-pub fn disable() -> Result<()> {
+/// Treats "there is nothing there" and "I could not find out" as different
+/// answers. A caller surfaces a successful removal to the user as "the rules
+/// are gone", so an unreadable state — not root, no nftables, no `nf_tables` in
+/// the kernel — has to fail loudly rather than report a removal that never
+/// happened. Only a successful listing with no matching table means absent.
+///
+/// Note this forks `nft`, so the watcher calls it on a heartbeat rather than on
+/// every poll.
+pub fn table_present() -> Result<bool> {
     let listing = Command::new("nft")
         .args(["list", "tables"])
         .output()
@@ -290,7 +292,17 @@ pub fn disable() -> Result<()> {
             stderr.trim()
         );
     }
-    if !listing_names_table(&String::from_utf8_lossy(&listing.stdout)) {
+    Ok(listing_names_table(&String::from_utf8_lossy(
+        &listing.stdout,
+    )))
+}
+
+/// Remove the Dropship table, if it is there.
+///
+/// A missing table is the one case that is legitimately a success: it is
+/// already disabled, and saying so costs nothing.
+pub fn disable() -> Result<()> {
+    if !table_present()? {
         return Ok(());
     }
 
@@ -300,10 +312,7 @@ pub fn disable() -> Result<()> {
         .context("could not start nft; install nftables first")?;
     if !removal.status.success() {
         let stderr = String::from_utf8_lossy(&removal.stderr);
-        bail!(
-            "nft could not remove the Dropship table: {}",
-            stderr.trim()
-        );
+        bail!("nft could not remove the Dropship table: {}", stderr.trim());
     }
     Ok(())
 }
@@ -466,7 +475,9 @@ mod tests {
         // Right name, wrong family.
         assert!(!listing_names_table(&format!("table ip {TABLE}\n")));
         // A rule mentioning the name is not a table header.
-        assert!(!listing_names_table(&format!("\t\tip daddr @{TABLE} drop\n")));
+        assert!(!listing_names_table(&format!(
+            "\t\tip daddr @{TABLE} drop\n"
+        )));
         // A table whose name merely starts with ours.
         assert!(!listing_names_table(&format!("table inet {TABLE}_old\n")));
     }

@@ -53,4 +53,5 @@ jobs:
           path: |
             target/release/dropship-steamos
             target/release/dropship-steamos-helper
+            packaging/
           if-no-files-found: error

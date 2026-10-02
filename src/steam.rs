@@ -70,15 +70,107 @@ fn steam_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Whether a command line describes the game.
+///
+/// Split out so the `ps` path and the `/proc` path below share one definition
+/// rather than drifting apart.
+pub fn looks_like_overwatch(command_line: &str) -> bool {
+    let lowered = command_line.to_ascii_lowercase();
+    lowered.contains("overwatch.exe") || lowered.contains("_retail_/overwatch")
+}
+
 /// Extracts the PID of the running game from `ps -eo pid=,args=` output.
 pub fn overwatch_pid_from_ps(output: &str) -> Option<u32> {
     output.lines().find_map(|line| {
-        let lowered = line.to_ascii_lowercase();
-        if !(lowered.contains("overwatch.exe") || lowered.contains("_retail_/overwatch")) {
+        if !looks_like_overwatch(line) {
             return None;
         }
         line.split_whitespace().next()?.parse().ok()
     })
+}
+
+/// Whether a cgroup is one the game could plausibly be running in.
+///
+/// The game is found by looking for a process whose command line *looks* like
+/// Overwatch, which any process can imitate. This is the guard that keeps an
+/// imitator — or, far more likely, a stale or unrelated process — from choosing
+/// which cgroup the blocks get scoped to.
+///
+/// It is a **safety** control, not a security boundary. The threat it addresses
+/// is a wrong scope, not an escalation: the config that reaches the privileged
+/// watcher still cannot name a cgroup, and `deck` is the user the device
+/// already belongs to.
+///
+/// Deliberately does not name `app-steam@autostart.service`. That is the KDE
+/// *Desktop Mode autostart* unit; Game Mode runs a different session and will
+/// have a different path. Matching the shape rather than the exact name is what
+/// lets both modes work without a mode switch.
+pub fn is_game_cgroup(cgroup: &CgroupMatch) -> bool {
+    let mut in_app_slice = false;
+    let mut names_steam = false;
+    for segment in cgroup.path.split('/') {
+        if segment == "app.slice" {
+            in_app_slice = true;
+        }
+        if segment.to_ascii_lowercase().contains("steam") {
+            names_steam = true;
+        }
+    }
+    in_app_slice && names_steam
+}
+
+/// Every PID whose command line looks like the game, lowest first.
+///
+/// Reads `/proc` directly rather than shelling out to `ps`: this runs on a
+/// timer in a root daemon, and a process spawn every tick is not free on a
+/// battery-powered handheld.
+#[cfg(target_os = "linux")]
+pub fn overwatch_pids() -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .collect();
+    pids.sort_unstable();
+
+    pids.into_iter()
+        .filter(|pid| {
+            // cmdline is NUL-separated; join so the shared predicate sees
+            // something shaped like a `ps` line. A process that exited between
+            // the readdir and here simply drops out.
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| {
+                looks_like_overwatch(&String::from_utf8_lossy(&raw).replace('\0', " "))
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn overwatch_pids() -> Vec<u32> {
+    Vec::new()
+}
+
+/// The cgroup the game is running in, chosen from every candidate rather than
+/// the first one found.
+///
+/// `overwatch_pid_from_ps` returns the *lowest* matching PID, and PIDs are
+/// handed out in ascending order — so a stale or long-lived process that merely
+/// resembles the game outranks the real one, which always has a high, recently
+/// allocated PID. Resolving every candidate and keeping the first with a
+/// plausible cgroup is what makes the live game win that race.
+#[cfg(target_os = "linux")]
+pub fn running_game_cgroup() -> Option<CgroupMatch> {
+    overwatch_pids()
+        .into_iter()
+        .filter_map(cgroup_for_pid)
+        .find(is_game_cgroup)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn running_game_cgroup() -> Option<CgroupMatch> {
+    None
 }
 
 pub fn overwatch_pid() -> Option<u32> {
@@ -204,5 +296,63 @@ mod tests {
     fn unparseable_pid_field_is_ignored() {
         let ps = "notapid Overwatch.exe\n";
         assert_eq!(overwatch_pid_from_ps(ps), None);
+    }
+
+    /// Measured on the Deck, Desktop Mode.
+    const DESKTOP_CGROUP: &str =
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam@autostart.service";
+
+    #[test]
+    fn the_measured_desktop_mode_cgroup_is_accepted() {
+        let cgroup = CgroupMatch::from_path(DESKTOP_CGROUP).unwrap();
+        assert!(is_game_cgroup(&cgroup));
+    }
+
+    #[test]
+    fn game_mode_is_accepted_without_naming_the_desktop_unit() {
+        // Game Mode has not been measured yet, but it runs a different session
+        // and so a different unit name. Matching on shape rather than on the
+        // Desktop Mode name is what keeps that from being a mode switch.
+        let cgroup = CgroupMatch::from_path(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam-app2357570-4242.scope",
+        )
+        .unwrap();
+        assert!(is_game_cgroup(&cgroup));
+    }
+
+    #[test]
+    fn a_renamed_process_outside_a_steam_scope_is_rejected() {
+        // The spoof this exists to stop: `exec -a Overwatch.exe sleep 9999`
+        // runs in the user's own session scope, not under app.slice.
+        let cgroup =
+            CgroupMatch::from_path("/user.slice/user-1000.slice/user@1000.service/session.slice")
+                .unwrap();
+        assert!(!is_game_cgroup(&cgroup));
+    }
+
+    #[test]
+    fn a_steam_scope_outside_app_slice_is_rejected() {
+        let cgroup =
+            CgroupMatch::from_path("/user.slice/user-1000.slice/user@1000.service/steam.scope")
+                .unwrap();
+        assert!(!is_game_cgroup(&cgroup));
+    }
+
+    #[test]
+    fn an_app_slice_scope_without_steam_is_rejected() {
+        let cgroup = CgroupMatch::from_path(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox@1.service",
+        )
+        .unwrap();
+        assert!(!is_game_cgroup(&cgroup));
+    }
+
+    #[test]
+    fn the_shared_command_line_predicate_is_case_insensitive() {
+        assert!(looks_like_overwatch("Overwatch.EXE"));
+        assert!(looks_like_overwatch("wine64 _retail_/Overwatch.exe"));
+        assert!(!looks_like_overwatch("/usr/bin/firefox"));
+        // The OldGame folder is not the game.
+        assert!(!looks_like_overwatch("_retail_/OldGame.exe"));
     }
 }
