@@ -140,10 +140,14 @@ pub fn run(config_path: &Path) -> Result<()> {
     let mut last_heartbeat = Instant::now();
     let mut since = epoch_secs();
 
-    // Both of these exist to keep the journal readable. The loop runs every few
-    // seconds forever, so anything printed unconditionally becomes noise, and
-    // noise is how a real failure goes unnoticed.
-    let mut last_line: Option<String> = None;
+    // These two exist to keep the journal readable. The loop runs every few
+    // seconds forever, so a *failure* that persists must not print forever —
+    // noise is how a real failure goes unnoticed. State transitions are the
+    // opposite: they are rare, each one matters, and deduping them was hiding
+    // both churn and the re-apply that follows a Steam restart, whose log line
+    // is identical because the cgroup path is identical. Hence two mechanisms:
+    // `note` for failures, `report` for transitions.
+    let mut last_error: Option<String> = None;
     let mut last_config_error: Option<String> = None;
 
     println!("watching for Overwatch; config {}", config_path.display());
@@ -187,31 +191,35 @@ pub fn run(config_path: &Path) -> Result<()> {
         match &decision {
             Decision::Apply(plan) => match firewall::apply(plan) {
                 Ok(()) => {
-                    watcher.applied(ScopedCgroup::of(&plan.cgroup));
-                    table_present = true;
-                    since = epoch_secs();
-                    note(
-                        &mut last_line,
+                    // Read the identity *after* the rules are up, so what is
+                    // recorded is the cgroup object nft has just bound them to.
+                    let scoped = ScopedCgroup::of(&plan.cgroup);
+                    report(
+                        &mut last_error,
                         format!(
-                            "applied {} blocks scoped to {}",
+                            "applied {} blocks scoped to {} (cgroup {})",
                             plan.ipv4.len() + plan.ipv6.len(),
-                            plan.cgroup.path
+                            plan.cgroup.path,
+                            describe_inode(scoped.inode),
                         ),
                     );
+                    watcher.applied(scoped);
+                    table_present = true;
+                    since = epoch_secs();
                     publish_state(watcher.current().cloned(), revision, "apply", since)?;
                 }
-                Err(error) => note(&mut last_line, format!("could not apply blocks: {error:#}")),
+                Err(error) => note(&mut last_error, format!("could not apply blocks: {error:#}")),
             },
             Decision::Disable => match firewall::disable() {
                 Ok(()) => {
                     watcher.removed();
                     table_present = false;
                     since = epoch_secs();
-                    note(&mut last_line, "removed blocks".to_owned());
+                    report(&mut last_error, "removed blocks".to_owned());
                     publish_state(None, revision, "disable", since)?;
                 }
                 Err(error) => note(
-                    &mut last_line,
+                    &mut last_error,
                     format!("could not remove blocks: {error:#}"),
                 ),
             },
@@ -261,12 +269,34 @@ fn publish_state(
     Ok(())
 }
 
-/// Prints `line` unless it is the same as last time.
+/// Prints a state transition, unconditionally.
+///
+/// Never suppressed, because the two things suppression was hiding are exactly
+/// the things worth seeing: a watcher that re-applies every tick, and the
+/// re-apply after a Steam restart — whose path is unchanged by design, so its
+/// line is only distinguishable by the cgroup identity carried alongside it.
+/// Clearing the failure memory here means a failure that recurs after a
+/// successful transition is reported again rather than swallowed.
+fn report(last_error: &mut Option<String>, line: String) {
+    println!("{line}");
+    *last_error = None;
+}
+
+/// Prints a failure `line` unless it is the same as last time.
+///
+/// Failures are the ones that can repeat every couple of seconds forever, so
+/// this is where deduping belongs.
 fn note(last: &mut Option<String>, line: String) {
     if last.as_deref() != Some(line.as_str()) {
         println!("{line}");
         *last = Some(line);
     }
+}
+
+/// Renders a cgroup inode for the log, where `None` has to read as "could not
+/// tell" rather than as a number.
+fn describe_inode(inode: Option<u64>) -> String {
+    inode.map_or_else(|| "unknown".to_owned(), |inode| inode.to_string())
 }
 
 fn epoch_secs() -> u64 {
@@ -303,6 +333,15 @@ mod tests {
         );
 
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_inode_reads_as_unknown_rather_than_a_number() {
+        // This goes into the log line that is the only evidence a Steam-restart
+        // re-apply happened. Rendering a missing inode as 0 would make two
+        // different cgroups look like the same one.
+        assert_eq!(describe_inode(Some(31_422)), "31422");
+        assert_eq!(describe_inode(None), "unknown");
     }
 
     #[test]

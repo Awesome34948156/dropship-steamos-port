@@ -225,9 +225,13 @@ impl RulePlan {
 
 pub fn apply(plan: &RulePlan) -> Result<()> {
     plan.validate()?;
+    // Best effort, and deliberately silent. On a first apply the table is
+    // simply not there, and nft says so on stderr; inheriting that would put an
+    // error in the journal on every clean apply, which is how a real one gets
+    // missed. The rebuild below is what matters, and it reports its own failure.
     let _ = Command::new("nft")
         .args(["delete", "table", "inet", TABLE])
-        .status();
+        .output();
     let mut child = Command::new("nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
