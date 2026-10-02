@@ -89,6 +89,20 @@ To exercise the watcher by hand before involving systemd:
 sudo ./target/debug/dropship-steamos-helper watch --config "$HOME/.config/dropship-steamos/service.json"
 ```
 
+### Testing on the device
+
+`cargo test` cannot reach the parts that only exist on SteamOS: real cgroups, real nft, real systemd hardening. `scripts/` holds the checks that have to run on the Deck, as root. None of them needs Overwatch installed — they fake the game with a transient `systemd-run --user` scope shaped exactly like Steam's — which also means a real launch is still worth doing by hand once.
+
+| Script | What it answers |
+|---|---|
+| `spike-cgroup.sh` | Do the kernel and nft do what the design assumes? Run with Overwatch in **Game Mode**; `--drop` proves a scoped drop actually cuts traffic. |
+| `cgroup-recreate-test.sh` | Does an nft cgroupv2 rule survive its cgroup being destroyed and recreated? The hazard that makes a Steam restart dangerous. |
+| `watcher-test.sh` | Does the watcher's cycle work — apply on launch, remove on exit, re-apply after the cgroup is recreated? Drives the binary alone, so it passes even when the unit is broken. |
+| `post-install-test.sh` | Does the **installed service** work under systemd's hardening? The only one that can catch a sandbox mistake, because it goes through the unit. |
+| `diagnose-service.sh` | The service is active but never applies. Bisects the hardening directives until one is named. |
+
+The last two hardcode the installed paths under `/home/deck` and `/var/lib/dropship-steamos` on purpose: those paths are the thing being checked.
+
 ## License
 
 GPL-3.0-only. This project is a SteamOS-oriented reimplementation inspired by [stowmyy/dropship](https://github.com/stowmyy/dropship), whose catalogue URL is used during this initial milestone.
