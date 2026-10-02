@@ -1,0 +1,56 @@
+name: build-linux
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Pin the runner deliberately. The Deck runs glibc 2.41 (SteamOS 20260922.1);
+    # ubuntu-24.04 ships 2.39, so a binary built here runs there. A *newer* runner
+    # would emit GLIBC_2.4x symbol references the Deck cannot resolve, and the only
+    # symptom is "version `GLIBC_2.42' not found" when launching on device.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # eframe pulls in winit/glutin, which need these headers to *build* against.
+      # At runtime the Deck already has all of the shared objects.
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libx11-dev libxcb1-dev libxkbcommon-dev \
+            libxrandr-dev libxi-dev libxcursor-dev \
+            libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: test
+        run: cargo test --all-targets
+
+      - name: build
+        run: cargo build --release
+
+      # Catches a broken link line, and records which libc symbols the binary
+      # actually requires, so a future glibc skew is visible in the log.
+      - name: inspect linkage
+        run: |
+          ldd target/release/dropship-steamos
+          objdump -T target/release/dropship-steamos \
+            | grep -o 'GLIBC_[0-9.]*' | sort -u -V | tail -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dropship-steamos-linux-x86_64
+          path: |
+            target/release/dropship-steamos
+            target/release/dropship-steamos-helper
+          if-no-files-found: error
