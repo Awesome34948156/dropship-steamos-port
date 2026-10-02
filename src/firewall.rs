@@ -196,22 +196,56 @@ pub fn apply(plan: &RulePlan) -> Result<()> {
     Ok(())
 }
 
+/// Whether `nft list tables` output names the Dropship table.
+///
+/// `nft list tables` prints one `table <family> <name>` header per table, so the
+/// fields are compared rather than the line searched: a rule that merely mentions
+/// the name cannot be mistaken for the table itself. A trailing `{` is tolerated
+/// so neither output form reads as "absent" and silently skips the removal.
+fn listing_names_table(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("table")
+            && fields.next() == Some("inet")
+            && fields.next().map(|name| name.trim_end_matches('{')) == Some(TABLE)
+    })
+}
+
+/// Remove the Dropship table, if it is there.
+///
+/// Look before acting, and treat "there is nothing to remove" and "I could not
+/// find out" as different answers. The caller surfaces success to the user as
+/// "the rules are gone", so an unreadable state — not root, no nftables, no
+/// `nf_tables` in the kernel — has to fail loudly rather than report a removal
+/// that never happened. A missing table is the one case that is legitimately a
+/// success: it is already disabled.
 pub fn disable() -> Result<()> {
-    let exists = Command::new("nft")
-        .args(["list", "table", "inet", TABLE])
-        .status()
-        .context("could not start nft; install nftables first")?
-        .success();
-    if !exists {
+    let listing = Command::new("nft")
+        .args(["list", "tables"])
+        .output()
+        .context("could not start nft; install nftables first")?;
+    if !listing.status.success() {
+        let stderr = String::from_utf8_lossy(&listing.stderr);
+        bail!(
+            "could not list nftables tables, so whether Dropship rules are installed is \
+             unknown: {}",
+            stderr.trim()
+        );
+    }
+    if !listing_names_table(&String::from_utf8_lossy(&listing.stdout)) {
         return Ok(());
     }
 
-    let status = Command::new("nft")
+    let removal = Command::new("nft")
         .args(["delete", "table", "inet", TABLE])
-        .status()
+        .output()
         .context("could not start nft; install nftables first")?;
-    if !status.success() {
-        bail!("Dropship table did not exist or nft could not remove it");
+    if !removal.status.success() {
+        let stderr = String::from_utf8_lossy(&removal.stderr);
+        bail!(
+            "nft could not remove the Dropship table: {}",
+            stderr.trim()
+        );
     }
     Ok(())
 }
@@ -354,5 +388,28 @@ mod tests {
             assert!(line.contains("socket cgroupv2"), "unscoped rule: {line}");
             assert!(line.ends_with(" drop"), "not a drop rule: {line}");
         }
+    }
+
+    #[test]
+    fn listing_finds_the_dropship_table() {
+        assert!(listing_names_table(&format!("table inet {TABLE}\n")));
+        assert!(listing_names_table(&format!(
+            "table ip nat\ntable inet {TABLE}\n"
+        )));
+        // `nft list table` prints a brace; stay tolerant of either form so a
+        // formatting change cannot be read as "absent" and skip the removal.
+        assert!(listing_names_table(&format!("table inet {TABLE} {{\n")));
+    }
+
+    #[test]
+    fn listing_ignores_anything_that_is_not_the_dropship_table() {
+        assert!(!listing_names_table(""));
+        assert!(!listing_names_table("table inet dropship_spike\n"));
+        // Right name, wrong family.
+        assert!(!listing_names_table(&format!("table ip {TABLE}\n")));
+        // A rule mentioning the name is not a table header.
+        assert!(!listing_names_table(&format!("\t\tip daddr @{TABLE} drop\n")));
+        // A table whose name merely starts with ours.
+        assert!(!listing_names_table(&format!("table inet {TABLE}_old\n")));
     }
 }
