@@ -54,9 +54,190 @@ jobs:
             target/release/dropship-steamos
             target/release/dropship-steamos-helper
             packaging/
-            # install.sh looks for the launcher icon at $REPO/assets/icons/…,
-            # relative to its own parent. Without this the launcher entry
-            # installs pointing at an icon that was never shipped, and the
-            # failure is silent: install.sh guards the copy with [ -f ].
+            # packaging/install.sh looks for the launcher icon at
+            # $REPO/assets/icons/…, relative to its own parent. Without this the
+            # install now fails outright rather than installing quietly: the
+            # installer's preflight requires the icon, the unit template and the
+            # launcher template, and refuses to write anything if one is absent.
             assets/icons/game-icon-overwatch.svg
           if-no-files-found: error
+
+  release:
+    needs: build
+
+    # Job-level, not workflow-level. Only this job creates a release, and a
+    # workflow-level grant would hand the write token to the build job as well,
+    # which runs on every pull request. A job-level grant also overrides the
+    # repository's default workflow-permission setting, so this works even when
+    # that default is read-only — which is otherwise the most common way a
+    # pipeline like this fails silently, with a green check and no release.
+    permissions:
+      contents: write
+
+    # Only a tag publishes. A push to main, a pull request, or a manual run
+    # still builds and uploads the artifact above, but must never move a
+    # release: the artifact is a debugging convenience, the release is a promise.
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    # Nothing is compiled here, so this pin is not about glibc. It is so that
+    # this file names exactly one Ubuntu version and nobody has to work out
+    # which of the two jobs the "use 24.04" rule applies to.
+    runs-on: ubuntu-24.04
+
+    steps:
+      # The checkout supplies install.sh, packaging/, assets/, README.md and
+      # LICENSE at the tagged commit. The artifact supplies the two binaries and
+      # nothing else: they cannot be rebuilt identically on a second runner, so
+      # whatever the build job tested is what ships.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dropship-steamos-linux-x86_64
+          path: artifact
+
+      # The tag is the version of record. If it disagreed with Cargo.toml the
+      # release would be named 0.2.0 and carry a 0.1.0 binary, and nothing
+      # downstream would ever catch it.
+      - name: the tag must match Cargo.toml
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          manifest=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          if [ "$version" != "$manifest" ]; then
+            echo "tag ${GITHUB_REF_NAME} disagrees with Cargo.toml ($manifest)" >&2
+            exit 1
+          fi
+          echo "packaging version $version"
+
+      - name: stage and pack the release tree
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          stage=dropship-steamos-$version
+
+          test -x artifact/target/release/dropship-steamos
+          test -x artifact/target/release/dropship-steamos-helper
+
+          mkdir -p "$stage/packaging" "$stage/assets/icons"
+          # install(1), not cp: every mode is stated here rather than inherited
+          # from the checkout's umask or git's exec bit, so the archive is right
+          # even if a file's mode in git is wrong.
+          install -m 0755 artifact/target/release/dropship-steamos        "$stage/dropship-steamos"
+          install -m 0755 artifact/target/release/dropship-steamos-helper "$stage/dropship-steamos-helper"
+          install -m 0755 install.sh                                      "$stage/install.sh"
+          install -m 0755 packaging/install.sh                            "$stage/packaging/install.sh"
+          install -m 0644 packaging/dropship-steamos.service              "$stage/packaging/"
+          install -m 0644 packaging/dropship-steamos.desktop              "$stage/packaging/"
+          install -m 0644 assets/icons/game-icon-overwatch.svg            "$stage/assets/icons/"
+          install -m 0644 README.md LICENSE                               "$stage/"
+
+          # "$stage" is a bare relative name, so no member of the archive is
+          # absolute and none contains ".."; extraction produces exactly one
+          # directory. Fixed mtime and zeroed ownership so two runs over the same
+          # inputs differ only in the bytes of the binaries themselves. gzip -n
+          # drops the timestamp and the original filename, the other two things
+          # that would otherwise change on every run for no reason.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime='UTC 1980-01-01' \
+              -cf - "$stage" | gzip -9n > "$stage-linux-x86_64.tar.gz"
+
+          sha256sum "$stage-linux-x86_64.tar.gz" > SHA256SUMS
+
+      # Everything here could be checked by hand afterwards. The point of doing
+      # it in the job is that a broken archive never gets a URL: a pre-release is
+      # the wrong place to discover the tarball extracts wrong.
+      - name: verify the archive before it gets a URL
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          stage=dropship-steamos-$version
+          tarball=$stage-linux-x86_64.tar.gz
+
+          sha256sum -c SHA256SUMS
+
+          # Exactly one top level, and every member underneath it.
+          tar -tzf "$tarball" | grep -v '/$' | while read -r p; do
+            case "$p" in
+              "$stage"/*) ;;
+              *) echo "unexpected path in the archive: $p" >&2; exit 1 ;;
+            esac
+          done
+
+          for p in \
+            "$stage/install.sh" \
+            "$stage/dropship-steamos" \
+            "$stage/dropship-steamos-helper" \
+            "$stage/packaging/install.sh" \
+            "$stage/packaging/dropship-steamos.service" \
+            "$stage/packaging/dropship-steamos.desktop" \
+            "$stage/assets/icons/game-icon-overwatch.svg" \
+            "$stage/README.md" \
+            "$stage/LICENSE"
+          do
+            tar -tzf "$tarball" | grep -qx "$p" || { echo "missing $p" >&2; exit 1; }
+          done
+
+          # An archive that extracts with the exec bit missing gives the user
+          # "./install.sh: Permission denied", which reads as "the download is
+          # broken" and is not obviously diagnosable from there.
+          tar -tvzf "$tarball" | awk '$1 ~ /^-rwxr-xr-x$/ {print $NF}' | sort > actual-exec
+          printf '%s\n' \
+            "$stage/dropship-steamos" \
+            "$stage/dropship-steamos-helper" \
+            "$stage/install.sh" \
+            "$stage/packaging/install.sh" | sort > expected-exec
+          diff -u expected-exec actual-exec
+
+          mkdir -p unpacked
+          tar -xzf "$tarball" -C unpacked
+          sh -n "unpacked/$stage/install.sh"
+          sh -n "unpacked/$stage/packaging/install.sh"
+          # shellcheck is preinstalled on the runner. This is the only place
+          # either script is ever executed by a machine that is not a Deck.
+          shellcheck -s sh "unpacked/$stage/install.sh" "unpacked/$stage/packaging/install.sh"
+
+      # The only automated proof that the installer's preflight works, and it is
+      # safe on a runner precisely because the preflight runs before any
+      # mutation: no systemctl, no nft, nothing that needs a real systemd.
+      - name: a missing binary must fail before anything is installed
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          stage=dropship-steamos-$version
+
+          # The GUI path is deliberately wrong. A download missing a binary has
+          # to fail in the first second, not after /etc and /var/lib have been
+          # written and the report claims a launcher entry that does not exist.
+          if sudo env DROPSHIP_STEAMOS_HELPER="$PWD/unpacked/$stage/dropship-steamos-helper" \
+                      DROPSHIP_STEAMOS_GUI=/nonexistent \
+                      "unpacked/$stage/packaging/install.sh" >/dev/null 2>&1
+          then
+            echo "the installer accepted a missing GUI binary" >&2
+            exit 1
+          fi
+          test ! -e /etc/systemd/system/dropship-steamos.service
+
+      - name: publish the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          tarball=dropship-steamos-$version-linux-x86_64.tar.gz
+          notes=.github/release-notes/$version.md
+
+          # A release with no written caveat is worse than no release: the whole
+          # point of marking this a pre-release is naming which half of the
+          # feature has been exercised on real hardware.
+          test -f "$notes" || { echo "no release notes at $notes" >&2; exit 1; }
+
+          # Only the tarball and the checksum are attached. Publishing the loose
+          # binaries as well would invite someone to download the helper on its
+          # own and run it as root, which is the failure the archive layout
+          # exists to prevent.
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Dropship for SteamOS $version" \
+            --prerelease \
+            --notes-file "$notes" \
+            "$tarball" SHA256SUMS
