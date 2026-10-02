@@ -2,6 +2,23 @@
 
 An in-progress, native SteamOS server selector for Overwatch 2. It uses the public Dropship server catalogue and creates a dedicated `nftables` table named `dropship_steamos`.
 
+## Install from a release
+
+If you just want to run this on a Steam Deck, you do not need a Rust toolchain. Take the archive from [Releases](https://github.com/Awesome34948156/dropship-steamos-port/releases) — it contains both binaries, the installer and the icon.
+
+```sh
+tar -xzf dropship-steamos-0.1.0-linux-x86_64.tar.gz
+cd dropship-steamos-0.1.0
+sha256sum -c SHA256SUMS      # optional; prints "...tar.gz: OK"
+sudo ./install.sh
+```
+
+That installs the privileged helper and the watcher service, and puts **Dropship for SteamOS** in the application launcher. Open it from the launcher, pick your regions, and switch on **Block while Overwatch runs**. Remove everything with `sudo ./install.sh --uninstall`.
+
+The archive is built on Ubuntu 24.04 deliberately. The Deck's glibc is *newer* than the build image's, so the binaries run there; a newer build image would produce symbols the Deck cannot resolve, and the only symptom would be a version error at launch. It is x86_64, so it is right for every Steam Deck and wrong for anything else.
+
+Releases are marked **pre-release** until a real Overwatch launch has driven the automatic path on hardware — see the notes on each release for exactly what has and has not been verified. Pre-releases do not appear under "Latest", so use the Releases link above rather than a `/latest` URL.
+
 ## Current milestone
 
 - Native Rust/egui desktop UI.
@@ -16,7 +33,10 @@ An in-progress, native SteamOS server selector for Overwatch 2. It uses the publ
 
 Install once. From then on you choose regions in advance, and the rules appear when you launch the game and disappear when you quit — no password prompt on either end.
 
+From a release tarball, that is `sudo ./install.sh` as above. From a git checkout, it is:
+
 ```sh
+cargo build --release
 sudo packaging/install.sh
 ```
 
@@ -34,7 +54,8 @@ Two consequences worth knowing:
 To remove the service and the launcher entry:
 
 ```sh
-sudo packaging/install.sh --uninstall
+sudo packaging/install.sh --uninstall     # from a checkout
+sudo ./install.sh --uninstall             # from a release tarball
 ```
 
 ## Scoping
@@ -78,6 +99,8 @@ The privileged helper must be discoverable as `dropship-steamos-helper`, or supp
 ```sh
 DROPSHIP_STEAMOS_HELPER="$PWD/target/debug/dropship-steamos-helper" cargo run --bin dropship-steamos
 ```
+
+`packaging/install.sh` takes those same two variables to install from somewhere other than `target/release/`. `DROPSHIP_HELPER` and `DROPSHIP_GUI` also work there as older spellings, but the `DROPSHIP_STEAMOS_*` names are the ones the rest of the repo and the installed launcher entry use, and the ones to reach for.
 
 The helper is the only privileged entry point and accepts exactly three verbs: `apply` and `disable`, which the manual UI reaches over `pkexec`, and `watch --config <absolute path>`, which the service runs. It only ever creates or removes the `inet dropship_steamos` nftables table, and `apply`/`disable` refuse to run while the watcher holds its lock.
 
