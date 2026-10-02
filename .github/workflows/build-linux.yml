@@ -54,4 +54,9 @@ jobs:
             target/release/dropship-steamos
             target/release/dropship-steamos-helper
             packaging/
+            # install.sh looks for the launcher icon at $REPO/assets/icons/…,
+            # relative to its own parent. Without this the launcher entry
+            # installs pointing at an icon that was never shipped, and the
+            # failure is silent: install.sh guards the copy with [ -f ].
+            assets/icons/game-icon-overwatch.svg
           if-no-files-found: error

@@ -105,6 +105,17 @@ pub fn overwatch_pid_from_ps(output: &str) -> Option<u32> {
 /// *Desktop Mode autostart* unit; Game Mode runs a different session and will
 /// have a different path. Matching the shape rather than the exact name is what
 /// lets both modes work without a mode switch.
+///
+/// Measured on the Deck 2026-10-02: this also accepts
+/// `app.slice/steamos-manager.service`, a SteamOS user service that merely has
+/// "steam" in its name. That is a false positive, but an unreachable one — a
+/// cgroup is only ever selected for a process whose command line already looks
+/// like the game, and nothing in `steamos-manager` does, nor could `deck` put
+/// one there without root. It is left loose deliberately: tightening to
+/// `app-steam*` would also have to be right about Game Mode, whose cgroup has
+/// still not been measured, and being wrong there means blocking silently never
+/// happens at all. Loose-and-unreachable beats tight-and-maybe-broken until
+/// that path is known.
 pub fn is_game_cgroup(cgroup: &CgroupMatch) -> bool {
     let mut in_app_slice = false;
     let mut names_steam = false;
