@@ -86,7 +86,11 @@ detect_desktop_user() {
 DESKTOP_USER=$(detect_desktop_user)
 [ -n "$DESKTOP_USER" ] || die "could not work out which user's desktop this is; set SUDO_USER"
 DESKTOP_HOME=$(getent passwd "$DESKTOP_USER" | cut -d: -f6)
-[ -n "$DESKTOP_HOME" ] && [ -d "$DESKTOP_HOME" ] || die "no home directory for $DESKTOP_USER"
+# Deliberately an if, not `[ -n "$DESKTOP_HOME" ] && [ -d "$DESKTOP_HOME" ] || die`:
+# the shellcheck on the runner reads that chain as SC2015 and fails the release.
+if [ -z "$DESKTOP_HOME" ] || [ ! -d "$DESKTOP_HOME" ]; then
+    die "no home directory for $DESKTOP_USER"
+fi
 DESKTOP_GROUP=$(id -gn "$DESKTOP_USER")
 CONFIG_PATH=$DESKTOP_HOME/$SERVICE_USER_HOME_CONFIG
 
