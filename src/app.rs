@@ -9,7 +9,7 @@ use eframe::egui;
 
 use crate::{
     catalogue::{self, Catalogue},
-    firewall::{self, RulePlan},
+    firewall::{RulePlan, ScopedCgroup},
     settings::{self, Settings},
     steam,
 };
@@ -26,8 +26,9 @@ pub struct DropshipApp {
     status: String,
     show_rule_preview: bool,
     /// The cgroup the currently loaded rules were scoped to, so a relaunch of
-    /// the game can be detected and the user told to re-apply.
-    last_applied: Option<firewall::CgroupMatch>,
+    /// the game — or a restart of Steam, which rebuilds the game's cgroup at an
+    /// unchanged path — can be detected and the user told to re-apply.
+    last_applied: Option<ScopedCgroup>,
     last_steam_poll: Instant,
 }
 
@@ -154,8 +155,8 @@ impl DropshipApp {
 
         self.status = match result {
             Ok(()) if action == "apply" => {
-                self.last_applied = plan.map(|plan| plan.cgroup.clone());
-                "Blocks applied to Overwatch only. Other applications are unaffected.".to_owned()
+                self.last_applied = plan.map(|plan| ScopedCgroup::of(&plan.cgroup));
+                "Blocks applied, scoped to Overwatch's process tree.".to_owned()
             }
             Ok(()) => {
                 self.last_applied = None;
@@ -229,16 +230,21 @@ impl eframe::App for DropshipApp {
                 }
             }
 
-            // Only warn while the game is actually running in a *different*
-            // cgroup. A game that has simply exited is not a stale rule yet.
-            let stale = self
-                .last_applied
-                .as_ref()
-                .is_some_and(|applied| self.steam.cgroup.as_ref().is_some_and(|live| live != applied));
+            // Only warn while the game is actually running in a different
+            // scope. A game that has simply exited is not a stale rule yet.
+            // "Different" means the cgroup object, not just its path — a Steam
+            // restart rebuilds app-steam@autostart.service at an identical
+            // path, and rules bound to the old one then match nothing.
+            let stale = self.last_applied.as_ref().is_some_and(|applied| {
+                self.steam
+                    .cgroup
+                    .as_ref()
+                    .is_some_and(|live| !applied.still_matches(&ScopedCgroup::of(live)))
+            });
             if stale {
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    "Overwatch restarted — the existing blocks no longer match. Click Apply blocks again to re-scope them.",
+                    "Overwatch's process tree was replaced, so the existing blocks no longer match it. Click Apply blocks again to re-scope them.",
                 );
             }
 

@@ -90,6 +90,64 @@ impl CgroupMatch {
     }
 }
 
+/// A [`CgroupMatch`] together with the identity of the cgroup object it named.
+///
+/// nft resolves `socket cgroupv2` when the rule is added and keeps a reference
+/// to the cgroup it found, not to the path string it was given. Destroying that
+/// cgroup and recreating one at the same path therefore leaves the rule
+/// matching nothing, silently, while every name in sight is unchanged. That is
+/// what restarting Steam does to `app-steam@autostart.service` in Desktop Mode,
+/// so "are my rules still live?" cannot be answered from the path.
+///
+/// Measured on the Deck 2026-10-02: a rule scoped to a scratch cgroup blocked
+/// traffic from that cgroup; after `rmdir` and `mkdir` at the same path (inode
+/// 31366 → 31422) the identical traffic went through. Hence the inode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedCgroup {
+    pub cgroup: CgroupMatch,
+    /// Inode of `/sys/fs/cgroup/<path>` when it was read.
+    pub inode: Option<u64>,
+}
+
+impl ScopedCgroup {
+    /// Reads a cgroup's current identity from the filesystem.
+    pub fn of(cgroup: &CgroupMatch) -> Self {
+        Self {
+            cgroup: cgroup.clone(),
+            inode: cgroup_inode(&cgroup.path),
+        }
+    }
+
+    /// Whether rules applied against `self` still match the cgroup `live`
+    /// describes. False means those rules are scoped to a cgroup object that no
+    /// longer exists, so they match nothing until they are applied again.
+    ///
+    /// An inode that could not be read counts as a change — re-applying is
+    /// harmless, matching nothing while claiming to be applied is not. Only
+    /// when neither side could read one does this degrade to comparing the
+    /// path, which is all that was available before.
+    pub fn still_matches(&self, live: &Self) -> bool {
+        self.cgroup == live.cgroup && self.inode == live.inode
+    }
+}
+
+/// Inode of a cgroup directory.
+///
+/// A destroyed and recreated cgroup gets a fresh inode, which is the cheap
+/// signal that separates "the same cgroup" from "the same path, new cgroup".
+#[cfg(target_os = "linux")]
+fn cgroup_inode(path: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(format!("/sys/fs/cgroup/{path}"))
+        .ok()
+        .map(|meta| meta.ino())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_inode(_path: &str) -> Option<u64> {
+    None
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RulePlan {
     /// Mandatory: a plan without a cgroup would block the whole device, so it
@@ -411,5 +469,78 @@ mod tests {
         assert!(!listing_names_table(&format!("\t\tip daddr @{TABLE} drop\n")));
         // A table whose name merely starts with ours.
         assert!(!listing_names_table(&format!("table inet {TABLE}_old\n")));
+    }
+
+    #[test]
+    fn a_recreated_cgroup_is_not_the_same_scope() {
+        // The measured failure: identical path, new cgroup object. Every path
+        // comparison says "unchanged", which is why this went unnoticed.
+        let before = ScopedCgroup {
+            cgroup: example_cgroup(),
+            inode: Some(31_366),
+        };
+        let after = ScopedCgroup {
+            cgroup: example_cgroup(),
+            inode: Some(31_422),
+        };
+
+        assert_eq!(before.cgroup.path, after.cgroup.path);
+        assert!(!before.still_matches(&after));
+    }
+
+    #[test]
+    fn the_same_cgroup_object_still_matches() {
+        let cgroup = example_cgroup();
+        let applied = ScopedCgroup {
+            cgroup: cgroup.clone(),
+            inode: Some(7),
+        };
+        assert!(applied.still_matches(&ScopedCgroup {
+            cgroup,
+            inode: Some(7)
+        }));
+    }
+
+    #[test]
+    fn a_different_cgroup_never_matches() {
+        let applied = ScopedCgroup {
+            cgroup: example_cgroup(),
+            inode: Some(7),
+        };
+        let live = ScopedCgroup {
+            cgroup: CgroupMatch::from_path("/user.slice/app.slice/app-steam-1.scope").unwrap(),
+            inode: Some(7),
+        };
+        assert!(!applied.still_matches(&live));
+    }
+
+    #[test]
+    fn an_unreadable_inode_is_treated_as_a_change() {
+        // Prompting is recoverable; reporting rules as applied while unable to
+        // confirm which cgroup they are bound to is not.
+        let cgroup = example_cgroup();
+        let applied = ScopedCgroup {
+            cgroup: cgroup.clone(),
+            inode: Some(7),
+        };
+        assert!(!applied.still_matches(&ScopedCgroup {
+            cgroup,
+            inode: None
+        }));
+    }
+
+    #[test]
+    fn without_any_inode_this_degrades_to_the_path() {
+        // Non-Linux, or a filesystem that will not say: same path still counts
+        // as the same scope, which is all the old check could do.
+        let cgroup = example_cgroup();
+        let applied = ScopedCgroup {
+            cgroup: cgroup.clone(),
+            inode: None,
+        };
+        assert!(applied.still_matches(&ScopedCgroup {
+            cgroup,
+            inode: None
+        }));
     }
 }
