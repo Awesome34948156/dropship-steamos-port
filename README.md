@@ -79,6 +79,8 @@ DROPSHIP_STEAMOS_HELPER="$PWD/target/debug/dropship-steamos-helper" cargo run --
 
 The helper is the only privileged entry point and accepts exactly three verbs: `apply` and `disable`, which the manual UI reaches over `pkexec`, and `watch --config <absolute path>`, which the service runs. It only ever creates or removes the `inet dropship_steamos` nftables table, and `apply`/`disable` refuse to run while the watcher holds its lock.
 
+The installed launcher entry is the normal way to start the app on the Deck. To watch stderr instead, `./run.sh` launches the same binaries from the terminal — but it has to be a terminal **inside the desktop session**, not an SSH shell. The window needs `WAYLAND_DISPLAY`, and the manual Apply path needs the session bus so KDE's polkit agent can answer the prompt; over SSH both are absent.
+
 To exercise the watcher by hand before involving systemd:
 
 ```sh
