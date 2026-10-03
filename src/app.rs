@@ -3,7 +3,7 @@ use std::{
     io::Write,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use eframe::egui;
@@ -11,7 +11,7 @@ use ipnet::IpNet;
 
 use crate::{
     catalogue::{self, Catalogue},
-    firewall::{RulePlan, ScopedCgroup},
+    firewall::{CgroupMatch, RulePlan, ScopedCgroup},
     service,
     service_config::{self, ServiceConfig},
     settings::{self, Settings},
@@ -20,27 +20,60 @@ use crate::{
 
 /// How often the running-game check is repeated so a newly launched Overwatch
 /// is noticed without the user clicking anything.
+///
+/// The check itself reads only `/proc`. It runs on a thread anyway, because the
+/// rule this window lives by is that its event loop never waits for anything —
+/// see [`spawn_game_prober`].
 const STEAM_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often to ask systemd about the service, and re-read what it published.
 ///
 /// Slower than the game poll because neither answer changes quickly, and asking
-/// systemd means forking `systemctl`.
+/// systemd means forking `systemctl`. Off the UI thread for the same reason, and
+/// with more at stake: a D-Bus round-trip is slow whenever systemd is busy, and
+/// the busiest it ever gets is while the machine is shutting down.
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct DropshipApp {
+    /// Cloned into every worker so it can wake the window when it has something
+    /// to say.
+    ///
+    /// This is what lets the polls move onto threads: the window sleeps between
+    /// results rather than ticking on a timer and doing the work itself.
+    ctx: egui::Context,
     settings: Settings,
     /// The contract written for the privileged watcher. Held so the toggle's
     /// state and the revision survive between writes.
     service: ServiceConfig,
     /// Whether the watcher service is running. When it is, it owns the nft
     /// table and this window must not touch it.
-    service_active: bool,
+    ///
+    /// `None` until the first answer arrives, so the window does not briefly
+    /// claim automatic blocking is not installed on a Deck that has it.
+    service_active: Option<bool>,
     /// What the service last published, for showing real status.
     service_state: Option<service::PublishedState>,
     catalogue: Option<Catalogue>,
     catalogue_rx: Option<Receiver<Result<Catalogue, String>>>,
+    /// Where Steam lives — the filesystem half of [`steam::SteamInstall`].
+    ///
+    /// Refreshed on demand rather than on a timer: finding it stats the Steam
+    /// libraries, including the removable ones under `/run/media`, and a `stat`
+    /// against a mount that is being torn down does not come back.
     steam: steam::SteamInstall,
+    /// The live half, fed by the game prober.
+    game_rx: Receiver<(Option<u32>, Option<CgroupMatch>)>,
+    /// A Steam-library scan that was asked for and has not answered yet.
+    ///
+    /// Doubles as the reason the hint reads "looking" rather than "not found":
+    /// an empty root means "no answer yet", not "no Steam".
+    install_rx: Option<Receiver<steam::SteamInstall>>,
+    service_rx: Receiver<(bool, Option<service::PublishedState>)>,
+    /// A privileged helper run that was asked for and has not finished.
+    ///
+    /// Its presence is also what disables the manual buttons: a second `pkexec`
+    /// would race the first for the same table.
+    helper_rx: Option<Receiver<HelperOutcome>>,
     status: String,
     show_rule_preview: bool,
     /// The cgroup the currently loaded rules were scoped to, so a relaunch of
@@ -50,12 +83,20 @@ pub struct DropshipApp {
     /// Only meaningful in the manual path. Once the service is running it knows
     /// this itself and publishes it.
     last_applied: Option<ScopedCgroup>,
-    last_steam_poll: Instant,
-    last_service_poll: Instant,
+}
+
+/// What a finished privileged run reports back.
+struct HelperOutcome {
+    /// `"apply"` or `"disable"`, echoed so the window knows which state to move
+    /// to without keeping a second copy of what it asked for.
+    action: &'static str,
+    /// The scope the rules were bound to, read once the helper had finished.
+    applied: Option<ScopedCgroup>,
+    result: Result<(), String>,
 }
 
 impl DropshipApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = settings::load().unwrap_or_else(|error| {
             eprintln!("Could not load settings: {error:#}");
             Settings::default()
@@ -66,22 +107,29 @@ impl DropshipApp {
             eprintln!("Starting from an empty service config: {error:#}");
             ServiceConfig::new(false, 0, Vec::new())
         });
-        let steam = steam::discover(settings.steam_app_id);
+
+        let ctx = cc.egui_ctx.clone();
         let mut app = Self {
+            game_rx: spawn_game_prober(ctx.clone()),
+            service_rx: spawn_service_prober(ctx.clone()),
+            ctx,
             settings,
             service,
-            service_active: service::is_active(),
+            service_active: None,
             service_state: None,
             catalogue: None,
             catalogue_rx: None,
-            steam,
+            steam: steam::SteamInstall::default(),
+            install_rx: None,
+            helper_rx: None,
             status: "Loading the current server catalogue…".to_owned(),
             show_rule_preview: false,
             last_applied: None,
-            last_steam_poll: Instant::now(),
-            last_service_poll: Instant::now(),
         };
+        // Neither of these is awaited. The window paints straight away and the
+        // answers fill in as they land, which is the whole point of the threads.
         app.refresh_catalogue();
+        app.refresh_install();
         app
     }
 
@@ -90,11 +138,28 @@ impl DropshipApp {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(catalogue::fetch().map_err(|error| error.to_string()));
+            ctx.request_repaint();
         });
         self.catalogue_rx = Some(rx);
         self.status = "Refreshing the server catalogue…".to_owned();
+    }
+
+    /// Starts a scan for where Steam lives, unless one is already running.
+    fn refresh_install(&mut self) {
+        if self.install_rx.is_some() {
+            return;
+        }
+        let app_id = self.settings.steam_app_id;
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(steam::discover(app_id));
+            ctx.request_repaint();
+        });
+        self.install_rx = Some(rx);
     }
 
     fn poll_catalogue(&mut self) {
@@ -127,28 +192,68 @@ impl DropshipApp {
         }
     }
 
-    fn poll_steam(&mut self, ctx: &egui::Context) {
-        if self.last_steam_poll.elapsed() < STEAM_POLL_INTERVAL {
-            ctx.request_repaint_after(STEAM_POLL_INTERVAL - self.last_steam_poll.elapsed());
-            return;
+    /// Applies whatever the game prober has sent since the last frame.
+    ///
+    /// Drained rather than taken once, so a frame that was slow to come round
+    /// shows the newest answer instead of working through a backlog.
+    fn poll_game(&mut self) {
+        while let Ok((game_pid, cgroup)) = self.game_rx.try_recv() {
+            self.steam.game_pid = game_pid;
+            self.steam.cgroup = cgroup;
         }
-        self.steam = steam::discover(self.settings.steam_app_id);
-        self.last_steam_poll = Instant::now();
-        ctx.request_repaint_after(STEAM_POLL_INTERVAL);
     }
 
-    fn poll_service(&mut self, ctx: &egui::Context) {
-        if self.last_service_poll.elapsed() < SERVICE_POLL_INTERVAL {
+    fn poll_install(&mut self) {
+        let Some(rx) = self.install_rx.take() else {
             return;
-        }
-        self.service_active = service::is_active();
-        self.service_state = if self.service_active {
-            service::read_state().ok()
-        } else {
-            None
         };
-        self.last_service_poll = Instant::now();
-        ctx.request_repaint_after(SERVICE_POLL_INTERVAL);
+        match rx.try_recv() {
+            Ok(install) => {
+                // Only the filesystem half is taken. The live half belongs to
+                // the prober, which refreshes it every couple of seconds and is
+                // therefore always at least as fresh as this scan.
+                self.steam.root = install.root;
+                self.steam.proton_prefix = install.proton_prefix;
+                self.steam.installed = install.installed;
+            }
+            Err(mpsc::TryRecvError::Empty) => self.install_rx = Some(rx),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.status = "Could not look for Steam.".to_owned();
+            }
+        }
+    }
+
+    fn poll_service(&mut self) {
+        while let Ok((active, state)) = self.service_rx.try_recv() {
+            self.service_active = Some(active);
+            self.service_state = state;
+        }
+    }
+
+    /// Picks up a finished privileged run.
+    fn poll_helper(&mut self) {
+        let Some(rx) = self.helper_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(outcome) => {
+                self.status = match outcome.result {
+                    Ok(()) if outcome.action == "apply" => {
+                        self.last_applied = outcome.applied;
+                        "Blocks applied, scoped to Overwatch's process tree.".to_owned()
+                    }
+                    Ok(()) => {
+                        self.last_applied = None;
+                        "All Dropship SteamOS firewall rules were removed.".to_owned()
+                    }
+                    Err(error) => error,
+                };
+            }
+            Err(mpsc::TryRecvError::Empty) => self.helper_rx = Some(rx),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.status = "The privileged helper stopped unexpectedly.".to_owned();
+            }
+        }
     }
 
     fn save_settings(&mut self) {
@@ -210,7 +315,18 @@ impl DropshipApp {
         }
     }
 
-    fn run_helper(&mut self, action: &str, plan: Option<&RulePlan>) {
+    /// Asks the privileged helper to change the rules, and returns at once.
+    ///
+    /// The exchange runs on a thread because both of its waits are unbounded:
+    /// `pkexec` will not read its input until the polkit agent has collected a
+    /// password, and will not exit until the helper is done. Doing that inline
+    /// is what used to freeze the window behind the password prompt — and, for a
+    /// plan large enough to fill the pipe buffer, deadlock before `wait` was
+    /// even reached.
+    fn run_helper(&mut self, action: &'static str, plan: Option<&RulePlan>) {
+        if self.helper_rx.is_some() {
+            return;
+        }
         let helper = std::env::var("DROPSHIP_STEAMOS_HELPER")
             .unwrap_or_else(|_| "dropship-steamos-helper".to_owned());
         let payload = match plan {
@@ -223,51 +339,45 @@ impl DropshipApp {
             },
             None => None,
         };
+        let scope = plan
+            .filter(|_| action == "apply")
+            .map(|plan| plan.cgroup.clone());
 
-        let result = (|| -> Result<(), String> {
-            let mut child = Command::new("pkexec")
-                .arg(&helper)
-                .arg(action)
-                .stdin(Stdio::piped())
-                .spawn()
-                .map_err(|error| format!("Could not request administrator access: {error}"))?;
-            if let Some(payload) = payload {
-                child
-                    .stdin
-                    .take()
-                    .ok_or("Could not open helper input")?
-                    .write_all(&payload)
-                    .map_err(|error| format!("Could not send firewall rules: {error}"))?;
-            }
-            if child.wait().map_err(|error| error.to_string())?.success() {
-                Ok(())
-            } else {
-                Err("The privileged helper did not complete successfully.".to_owned())
-            }
-        })();
-
-        self.status = match result {
-            Ok(()) if action == "apply" => {
-                self.last_applied = plan.map(|plan| ScopedCgroup::of(&plan.cgroup));
-                "Blocks applied, scoped to Overwatch's process tree.".to_owned()
-            }
-            Ok(()) => {
-                self.last_applied = None;
-                "All Dropship SteamOS firewall rules were removed.".to_owned()
-            }
-            Err(error) => error,
-        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = run_privileged_helper(&helper, action, payload);
+            // Read the scope *after* the rules are up, so what gets recorded is
+            // the cgroup object nft has just bound them to — the same ordering
+            // the service uses before it publishes. Reading it earlier would
+            // leave a window in which the cgroup could be replaced between the
+            // reading and the binding.
+            let applied = match &result {
+                Ok(()) if action == "apply" => scope.as_ref().map(ScopedCgroup::of),
+                _ => None,
+            };
+            let _ = tx.send(HelperOutcome {
+                action,
+                applied,
+                result,
+            });
+            ctx.request_repaint();
+        });
+        self.helper_rx = Some(rx);
+        self.status = "Waiting for administrator authorization…".to_owned();
     }
 }
 
 impl eframe::App for DropshipApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Every one of these collects what a thread has already finished. None
+        // of them waits for anything, which is what keeps this window answering
+        // the compositor even mid-shutdown.
         self.poll_catalogue();
-        self.poll_steam(ctx);
-        self.poll_service(ctx);
-        if self.catalogue_rx.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
+        self.poll_game();
+        self.poll_install();
+        self.poll_service();
+        self.poll_helper();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Dropship for SteamOS");
@@ -279,8 +389,7 @@ impl eframe::App for DropshipApp {
                     self.refresh_catalogue();
                 }
                 if ui.button("Refresh Steam status").clicked() {
-                    self.steam = steam::discover(self.settings.steam_app_id);
-                    self.last_steam_poll = Instant::now();
+                    self.refresh_install();
                 }
                 ui.label(&self.status);
             });
@@ -296,11 +405,17 @@ impl eframe::App for DropshipApp {
                 {
                     self.settings.steam_app_id = app_id;
                     self.save_settings();
-                    self.steam = steam::discover(app_id);
-                    self.last_steam_poll = Instant::now();
+                    self.refresh_install();
                 }
             });
-            ui.label(steam::steam_library_hint(&self.steam));
+            // An empty root means no answer yet, not no Steam — the scan is
+            // what fills it in, and saying "not found" before it lands would be
+            // a claim the window cannot support.
+            if self.install_rx.is_some() {
+                ui.label("Looking for Steam…");
+            } else {
+                ui.label(steam::steam_library_hint(&self.steam));
+            }
 
             match (&self.steam.cgroup, self.steam.game_running()) {
                 (Some(cgroup), _) => {
@@ -332,7 +447,7 @@ impl eframe::App for DropshipApp {
             //
             // Only relevant to the manual path; the running service re-scopes
             // itself without being asked.
-            let stale = !self.service_active
+            let stale = self.service_active != Some(true)
                 && self.last_applied.as_ref().is_some_and(|applied| {
                     self.steam
                         .cgroup
@@ -382,10 +497,18 @@ impl eframe::App for DropshipApp {
             }
 
             ui.separator();
-            if self.service_active {
-                self.service_controls(ui);
-            } else {
-                self.manual_controls(ui, &plan);
+            match self.service_active {
+                Some(true) => self.service_controls(ui),
+                Some(false) => self.manual_controls(ui, &plan),
+                None => {
+                    // Showing the manual controls here would tell the user
+                    // automatic blocking is not installed, which is a guess
+                    // until systemd has answered.
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Checking whether automatic blocking is installed…");
+                    });
+                }
             }
 
             if self.show_rule_preview {
@@ -478,18 +601,101 @@ impl DropshipApp {
             if ui.button("Preview nftables rules").clicked() {
                 self.show_rule_preview = !self.show_rule_preview;
             }
+            // Disabled while one is in flight: the second would race the first
+            // for the same table, and the user has a password prompt to answer.
+            let busy = self.helper_rx.is_some();
             let can_apply = self.settings.acknowledged_cgroup
                 && plan.as_ref().is_ok_and(|plan| !plan.is_empty());
             if ui
-                .add_enabled(can_apply, egui::Button::new("Apply blocks"))
+                .add_enabled(can_apply && !busy, egui::Button::new("Apply blocks"))
                 .clicked()
                 && let Ok(plan) = plan
             {
                 self.run_helper("apply", Some(plan));
             }
-            if ui.button("Disable all Dropship blocks").clicked() {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Disable all Dropship blocks"))
+                .clicked()
+            {
                 self.run_helper("disable", None);
             }
         });
+    }
+}
+
+/// Watches for the game on a thread of its own.
+///
+/// It reads nothing but `/proc`, so it cannot block; the thread is there because
+/// *any* work on the UI thread is work the event loop cannot do, and an event
+/// loop that stops servicing events is what the desktop reports as "not
+/// responding".
+///
+/// Exits when the window drops the receiver, so it never outlives the app.
+fn spawn_game_prober(ctx: egui::Context) -> Receiver<(Option<u32>, Option<CgroupMatch>)> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            if tx.send(steam::game_state()).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+            std::thread::sleep(STEAM_POLL_INTERVAL);
+        }
+    });
+    rx
+}
+
+/// Asks systemd about the watcher service on a thread of its own.
+///
+/// `systemctl` is a D-Bus round-trip, which takes as long as systemd takes to
+/// answer — and the longest it ever takes is while the machine is shutting down,
+/// which is precisely when the window must not be waiting on it.
+fn spawn_service_prober(ctx: egui::Context) -> Receiver<(bool, Option<service::PublishedState>)> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let active = service::is_active();
+            let state = if active {
+                service::read_state().ok()
+            } else {
+                None
+            };
+            if tx.send((active, state)).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+            std::thread::sleep(SERVICE_POLL_INTERVAL);
+        }
+    });
+    rx
+}
+
+/// Runs the privileged helper through `pkexec`, on a thread the caller owns.
+///
+/// Both waits here can last as long as the user takes to answer a password
+/// prompt, which is why this must never be called from the UI thread.
+fn run_privileged_helper(
+    helper: &str,
+    action: &str,
+    payload: Option<Vec<u8>>,
+) -> Result<(), String> {
+    let mut child = Command::new("pkexec")
+        .arg(helper)
+        .arg(action)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not request administrator access: {error}"))?;
+    if let Some(payload) = payload {
+        child
+            .stdin
+            .take()
+            .ok_or("Could not open helper input")?
+            .write_all(&payload)
+            .map_err(|error| format!("Could not send firewall rules: {error}"))?;
+    }
+    if child.wait().map_err(|error| error.to_string())?.success() {
+        Ok(())
+    } else {
+        Err("The privileged helper did not complete successfully.".to_owned())
     }
 }

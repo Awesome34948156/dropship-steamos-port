@@ -1,4 +1,6 @@
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
+#[cfg(not(target_os = "linux"))]
+use std::process::Command;
 
 use crate::firewall::CgroupMatch;
 
@@ -20,9 +22,14 @@ impl SteamInstall {
     }
 }
 
+/// The whole picture, filesystem included.
+///
+/// The expensive half of the pair with [`game_state`]: it stats the Steam
+/// libraries, which include the removable ones under `/run/media`. Call it when
+/// the answer could have changed — startup, a different app id, or a user
+/// asking — not on a timer.
 pub fn discover(app_id: u32) -> SteamInstall {
-    let game_pid = overwatch_pid();
-    let cgroup = game_pid.and_then(cgroup_for_pid);
+    let (game_pid, cgroup) = game_state();
 
     let root = steam_roots()
         .into_iter()
@@ -184,12 +191,42 @@ pub fn running_game_cgroup() -> Option<CgroupMatch> {
     None
 }
 
+/// The lowest PID whose command line looks like the game.
+///
+/// On Linux this is a `/proc` scan rather than a `ps` fork. The caller polls it
+/// on a timer, and forking the whole process table every tick is the kind of
+/// work that stops an event loop from answering — which is exactly what shows up
+/// as "not responding" while the machine is trying to shut down.
+///
+/// [`overwatch_pids`] sorts ascending, so the first entry is the lowest PID,
+/// which is what the `ps` path returned too.
+#[cfg(target_os = "linux")]
+pub fn overwatch_pid() -> Option<u32> {
+    overwatch_pids().first().copied()
+}
+
+/// See the Linux version above. The fork stays as the development fallback for
+/// platforms without `/proc`.
+#[cfg(not(target_os = "linux"))]
 pub fn overwatch_pid() -> Option<u32> {
     let output = Command::new("ps")
         .args(["-eo", "pid=,args="])
         .output()
         .ok()?;
     overwatch_pid_from_ps(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The live half of the picture: whether the game is running, and where.
+///
+/// Deliberately touches nothing but `/proc`, because this is the part that is
+/// polled on a timer. [`discover`] is the expensive half — it stats real
+/// filesystems, including the removable libraries under `/run/media` — and a
+/// `stat` on a mount that is being torn down is uninterruptible, which would
+/// wedge the calling thread through a shutdown rather than merely slow it.
+pub fn game_state() -> (Option<u32>, Option<CgroupMatch>) {
+    let game_pid = overwatch_pid();
+    let cgroup = game_pid.and_then(cgroup_for_pid);
+    (game_pid, cgroup)
 }
 
 /// Picks the cgroup v2 path out of `/proc/<pid>/cgroup` contents.

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
@@ -35,9 +35,19 @@ pub struct Server {
     pub ping: String,
 }
 
+/// How long to wait for the catalogue.
+///
+/// Bounded on purpose: without this a stalled connection pins the fetching
+/// thread and its channel forever, and the window sits on "Refreshing the
+/// server catalogue…" with no way out but a restart.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
 pub fn fetch() -> Result<Catalogue> {
     let response = reqwest::blocking::Client::builder()
         .user_agent("dropship-steamos/0.1")
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
         .build()?
         .get(CATALOGUE_URL)
         .send()
