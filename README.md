@@ -17,7 +17,7 @@ That installs the privileged helper and the watcher service, and puts **Dropship
 
 The archive is built on Ubuntu 24.04 deliberately. The Deck's glibc is *newer* than the build image's, so the binaries run there; a newer build image would produce symbols the Deck cannot resolve, and the only symptom would be a version error at launch. It is x86_64, so it is right for every Steam Deck and wrong for anything else.
 
-Releases are marked **pre-release** until a real Overwatch launch has driven the automatic path on hardware — see the notes on each release for exactly what has and has not been verified. Pre-releases do not appear under "Latest", so use the Releases link above rather than a `/latest` URL.
+See the notes on each release for exactly what has and has not been verified on real hardware. The one thing a stand-in process cannot prove is a real Overwatch launch driving the automatic path end to end, so that is named explicitly wherever it is still outstanding.
 
 ## Current milestone
 

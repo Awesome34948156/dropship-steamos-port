@@ -153,7 +153,7 @@ jobs:
           sha256sum "$stage-linux-x86_64.tar.gz" > SHA256SUMS
 
       # Everything here could be checked by hand afterwards. The point of doing
-      # it in the job is that a broken archive never gets a URL: a pre-release is
+      # it in the job is that a broken archive never gets a URL: a release is
       # the wrong place to discover the tarball extracts wrong.
       - name: verify the archive before it gets a URL
         run: |
@@ -226,7 +226,7 @@ jobs:
           fi
           test ! -e /etc/systemd/system/dropship-steamos.service
 
-      - name: publish the pre-release
+      - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -237,9 +237,9 @@ jobs:
           # v0.1.0.md, while $version has the v stripped.
           notes=.github/release-notes/$GITHUB_REF_NAME.md
 
-          # A release with no written caveat is worse than no release: the whole
-          # point of marking this a pre-release is naming which half of the
-          # feature has been exercised on real hardware.
+          # A release with no written caveat is worse than no release: the notes
+          # are the one place each release names which half of the feature has
+          # actually been exercised on real hardware.
           test -f "$notes" || { echo "no release notes at $notes" >&2; exit 1; }
 
           # Only the tarball and the checksum are attached. Publishing the loose
@@ -248,6 +248,5 @@ jobs:
           # exists to prevent.
           gh release create "$GITHUB_REF_NAME" \
             --title "Dropship for SteamOS $version" \
-            --prerelease \
             --notes-file "$notes" \
             "$tarball" SHA256SUMS
