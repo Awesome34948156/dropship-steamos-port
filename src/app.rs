@@ -380,7 +380,19 @@ impl eframe::App for DropshipApp {
         self.poll_helper();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Dropship for SteamOS");
+            ui.horizontal(|ui| {
+                ui.heading("Dropship for SteamOS");
+                // Right-aligned on the heading's own row. It is here so that
+                // which build is running is answerable at a glance — this is a
+                // device that gets its binaries from an artifact rather than
+                // from a build you just made, and "did the install take?" is
+                // otherwise a question with no answer in the window.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).weak(),
+                    );
+                });
+            });
             ui.label("Native Overwatch 2 server selection through nftables.");
             ui.separator();
 
