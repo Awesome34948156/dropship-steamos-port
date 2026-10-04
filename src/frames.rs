@@ -24,6 +24,17 @@
 //! same way the session's own `SIGTERM` does: at once, without teardown, so
 //! there is nothing left for the desktop to wait on. The app is launched again
 //! afterwards; until then a window that cannot draw is of no use to anyone.
+//!
+//! How long "far longer" is matters as much as the leaving does, and the first
+//! answer was wrong. Twenty seconds left the app alive through the window in
+//! which the desktop gives up on it: on a Deck on 2026-10-04 the app stranded a
+//! frame at 23:41:53 and the shutdown began at 23:42:13, so the app left at the
+//! very moment it was being asked about, and the dialog appeared anyway. The
+//! desktop's patience is a few seconds, which means the app has to be gone
+//! within a few seconds of a stall that, in the recorded cases, began while the
+//! user was still deciding to power off. [`STALL`] is now short enough to beat
+//! that, and the polls that already ask for a frame every two seconds are what
+//! keep it from being so short that an idle window looks stuck.
 
 use std::{
     sync::{
@@ -40,11 +51,12 @@ use eframe::egui;
 /// stuck.
 ///
 /// A frame here takes single-digit milliseconds, and the polls ask for a fresh
-/// one every two seconds even when nothing has changed. Twenty seconds is three
-/// orders of magnitude past anything honest, and still short enough that the
-/// process is gone long before a session that is shutting down would give up on
-/// the window and ask the user about it.
-const STALL: Duration = Duration::from_secs(20);
+/// one every two seconds even when nothing has changed, so five seconds is
+/// several missed requests — far past anything honest a frame could be doing,
+/// and short enough that the process is gone seconds after a stall rather than
+/// minutes. See the module documentation for why that second half is the part
+/// that has to hold.
+const STALL: Duration = Duration::from_secs(5);
 
 /// How long an idle window is left alone before a frame is asked for.
 ///
@@ -53,7 +65,15 @@ const STALL: Duration = Duration::from_secs(20);
 /// have to guess. In practice the polls already ask for a frame every two or
 /// five seconds, so this only fires once whatever was poking the window has
 /// stopped.
-const NUDGE: Duration = Duration::from_secs(5);
+const NUDGE: Duration = Duration::from_secs(2);
+
+/// How long a window that has never drawn anything gets.
+///
+/// The first frame is the expensive one: the graphics context is created, the
+/// shaders are compiled, and on a cold start that is seconds rather than
+/// milliseconds. Only a window that has proved it can draw is held to
+/// [`STALL`].
+const FIRST_FRAME: Duration = Duration::from_secs(20);
 
 /// How often the stamp is read.
 const TICK: Duration = Duration::from_secs(1);
@@ -69,8 +89,9 @@ enum Verdict {
     Leave,
 }
 
-fn verdict(idle: Duration) -> Verdict {
-    if idle >= STALL {
+fn verdict(idle: Duration, ever_drew: bool) -> Verdict {
+    let stuck_at = if ever_drew { STALL } else { FIRST_FRAME };
+    if idle >= stuck_at {
         Verdict::Leave
     } else if idle >= NUDGE {
         Verdict::Nudge
@@ -85,6 +106,10 @@ struct Stamp {
     origin: Instant,
     /// Milliseconds since `origin`. Zero until the first frame.
     millis: AtomicU64,
+    /// Whether any frame has started at all. A window that has never drawn is
+    /// held to [`FIRST_FRAME`] rather than [`STALL`], because its first frame
+    /// is allowed to be slow in a way that later ones are not.
+    drew: AtomicBool,
 }
 
 impl Stamp {
@@ -92,6 +117,10 @@ impl Stamp {
     fn idle(&self) -> Duration {
         let stamp = Duration::from_millis(self.millis.load(Ordering::Relaxed));
         self.origin.elapsed().saturating_sub(stamp)
+    }
+
+    fn ever_drew(&self) -> bool {
+        self.drew.load(Ordering::Relaxed)
     }
 }
 
@@ -110,20 +139,21 @@ impl FrameWatchdog {
         let stamp = Arc::new(Stamp {
             origin: Instant::now(),
             millis: AtomicU64::new(0),
+            drew: AtomicBool::new(false),
         });
         let stopped = Arc::new(AtomicBool::new(false));
         let (watched, watching) = (Arc::clone(&stamp), Arc::clone(&stopped));
         thread::spawn(move || {
             while !watching.load(Ordering::Relaxed) {
                 thread::sleep(TICK);
-                match verdict(watched.idle()) {
+                match verdict(watched.idle(), watched.ever_drew()) {
                     Verdict::Busy => {}
                     Verdict::Nudge => ctx.request_repaint(),
                     Verdict::Leave => {
                         eprintln!(
                             "The window has not been drawn for {}s, which means the display \
                              has stopped answering it; leaving rather than hanging.",
-                            STALL.as_secs()
+                            watched.idle().as_secs()
                         );
                         leave();
                     }
@@ -139,6 +169,7 @@ impl FrameWatchdog {
     pub fn frame_started(&self) {
         let since_origin = self.stamp.origin.elapsed().as_millis() as u64;
         self.stamp.millis.store(since_origin, Ordering::Relaxed);
+        self.stamp.drew.store(true, Ordering::Relaxed);
     }
 }
 
@@ -176,20 +207,31 @@ mod tests {
 
     #[test]
     fn a_frame_in_flight_is_left_alone() {
-        assert_eq!(verdict(Duration::ZERO), Verdict::Busy);
-        assert_eq!(verdict(Duration::from_millis(120)), Verdict::Busy);
+        assert_eq!(verdict(Duration::ZERO, true), Verdict::Busy);
+        assert_eq!(verdict(Duration::from_millis(120), true), Verdict::Busy);
     }
 
     #[test]
     fn an_idle_window_is_only_asked_for_a_frame() {
-        assert_eq!(verdict(NUDGE), Verdict::Nudge);
-        assert_eq!(verdict(STALL - TICK), Verdict::Nudge);
+        assert_eq!(verdict(NUDGE, true), Verdict::Nudge);
+        assert_eq!(verdict(STALL - TICK, true), Verdict::Nudge);
     }
 
     #[test]
     fn a_window_that_stopped_drawing_is_left() {
-        assert_eq!(verdict(STALL), Verdict::Leave);
-        assert_eq!(verdict(STALL * 10), Verdict::Leave);
+        assert_eq!(verdict(STALL, true), Verdict::Leave);
+        assert_eq!(verdict(STALL * 10, true), Verdict::Leave);
+    }
+
+    #[test]
+    fn a_window_that_has_never_drawn_is_given_longer() {
+        // A cold start spends seconds in the graphics context and the shader
+        // compiler before there is any frame to stamp. That is slow, not stuck,
+        // and it must not be an exit — but a window that never draws at all
+        // still is one.
+        assert_eq!(verdict(STALL, false), Verdict::Nudge);
+        assert_eq!(verdict(FIRST_FRAME - TICK, false), Verdict::Nudge);
+        assert_eq!(verdict(FIRST_FRAME, false), Verdict::Leave);
     }
 
     #[test]
@@ -200,12 +242,25 @@ mod tests {
     }
 
     #[test]
+    fn the_stall_is_short_enough_to_beat_a_shutdown() {
+        // The whole point of the number. The app stranded a frame twenty
+        // seconds before a shutdown and left at the moment it was asked about;
+        // the desktop's patience is a few seconds, so this has to be too.
+        assert!(
+            STALL <= Duration::from_secs(5),
+            "a longer stall is one the desktop can outwait"
+        );
+    }
+
+    #[test]
     fn a_stamp_that_was_never_beaten_reads_as_the_whole_clock() {
         let stamp = Stamp {
             origin: Instant::now() - Duration::from_secs(3),
             millis: AtomicU64::new(0),
+            drew: AtomicBool::new(false),
         };
         assert!(stamp.idle() >= Duration::from_secs(3));
+        assert!(!stamp.ever_drew());
     }
 
     #[test]
@@ -213,11 +268,14 @@ mod tests {
         let stamp = Stamp {
             origin: Instant::now(),
             millis: AtomicU64::new(0),
+            drew: AtomicBool::new(false),
         };
         stamp
             .millis
             .store(stamp.origin.elapsed().as_millis() as u64, Ordering::Relaxed);
+        stamp.drew.store(true, Ordering::Relaxed);
         assert!(stamp.idle() < TICK);
+        assert!(stamp.ever_drew());
     }
 
     // `FrameWatchdog::start` is deliberately not exercised here, and should not
