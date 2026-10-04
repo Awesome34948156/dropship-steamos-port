@@ -21,7 +21,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Only for the SIGTERM handler in the GUI: a session that is ending must be able
-# to take this process down even if it is mid-syscall.
+# Only for the GUI's two ways of leaving at once: the SIGTERM handler, because a
+# session that is ending must be able to take this process down even if it is
+# mid-syscall, and the frame watchdog, which uses the same handler to take itself
+# down when the display stops answering the window.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

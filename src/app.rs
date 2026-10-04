@@ -12,6 +12,7 @@ use ipnet::IpNet;
 use crate::{
     catalogue::{self, Catalogue},
     firewall::{CgroupMatch, RulePlan, ScopedCgroup},
+    frames::FrameWatchdog,
     service,
     service_config::{self, ServiceConfig},
     settings::{self, Settings},
@@ -83,6 +84,10 @@ pub struct DropshipApp {
     /// Only meaningful in the manual path. Once the service is running it knows
     /// this itself and publishes it.
     last_applied: Option<ScopedCgroup>,
+    /// Leaves the process if this window ever stops being drawn, which is the
+    /// one way its event loop can stop answering the desktop. See
+    /// [`crate::frames`].
+    watchdog: FrameWatchdog,
 }
 
 /// What a finished privileged run reports back.
@@ -125,6 +130,7 @@ impl DropshipApp {
             status: "Loading the current server catalogue…".to_owned(),
             show_rule_preview: false,
             last_applied: None,
+            watchdog: FrameWatchdog::start(cc.egui_ctx.clone()),
         };
         // Neither of these is awaited. The window paints straight away and the
         // answers fill in as they land, which is the whole point of the threads.
@@ -370,6 +376,7 @@ impl DropshipApp {
 
 impl eframe::App for DropshipApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.watchdog.frame_started();
         // Every one of these collects what a thread has already finished. None
         // of them waits for anything, which is what keeps this window answering
         // the compositor even mid-shutdown.
