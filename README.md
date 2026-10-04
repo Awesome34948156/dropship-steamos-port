@@ -7,11 +7,15 @@ An in-progress, native SteamOS server selector for Overwatch 2. It uses the publ
 If you just want to run this on a Steam Deck, you do not need a Rust toolchain. Take the archive from [Releases](https://github.com/Awesome34948156/dropship-steamos-port/releases) — it contains both binaries, the installer and the icon.
 
 ```sh
-tar -xzf dropship-steamos-0.1.1-linux-x86_64.tar.gz
-cd dropship-steamos-0.1.1
+tar -xzf dropship-steamos-<version>-linux-x86_64.tar.gz
+cd dropship-steamos-<version>
 sha256sum -c SHA256SUMS      # optional; prints "...tar.gz: OK"
 sudo ./install.sh
 ```
+
+Replace `<version>` with the one you downloaded. It is written that way on purpose: a literal
+version here goes stale the moment the next release is cut, and a README naming a file the
+release page does not have is worse than one naming no file at all.
 
 [INSTALL.md](INSTALL.md) writes these same steps out in full, including what to do when
 something does not work.

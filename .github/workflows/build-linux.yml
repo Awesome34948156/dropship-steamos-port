@@ -85,10 +85,10 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      # The checkout supplies install.sh, packaging/, assets/, README.md and
-      # LICENSE at the tagged commit. The artifact supplies the two binaries and
-      # nothing else: they cannot be rebuilt identically on a second runner, so
-      # whatever the build job tested is what ships.
+      # The checkout supplies install.sh, packaging/, assets/, README.md,
+      # INSTALL.md and LICENSE at the tagged commit. The artifact supplies the
+      # two binaries and nothing else: they cannot be rebuilt identically on a
+      # second runner, so whatever the build job tested is what ships.
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
@@ -138,7 +138,7 @@ jobs:
           install -m 0644 packaging/dropship-steamos.service              "$stage/packaging/"
           install -m 0644 packaging/dropship-steamos.desktop              "$stage/packaging/"
           install -m 0644 assets/icons/game-icon-overwatch.svg            "$stage/assets/icons/"
-          install -m 0644 README.md LICENSE                               "$stage/"
+          install -m 0644 README.md INSTALL.md LICENSE                    "$stage/"
 
           # "$stage" is a bare relative name, so no member of the archive is
           # absolute and none contains ".."; extraction produces exactly one
@@ -181,6 +181,7 @@ jobs:
             "$stage/packaging/dropship-steamos.desktop" \
             "$stage/assets/icons/game-icon-overwatch.svg" \
             "$stage/README.md" \
+            "$stage/INSTALL.md" \
             "$stage/LICENSE"
           do
             tar -tzf "$tarball" | grep -qx "$p" || { echo "missing $p" >&2; exit 1; }
