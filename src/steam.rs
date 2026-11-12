@@ -170,25 +170,117 @@ pub fn overwatch_pids() -> Vec<u32> {
     Vec::new()
 }
 
-/// The cgroup the game is running in, chosen from every candidate rather than
-/// the first one found.
+/// One process whose command line looked like the game, with the facts needed
+/// to tell the game itself from the launchers that started it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GameCandidate {
+    pub pid: u32,
+    /// The process that started this one, from `/proc/<pid>/stat`.
+    pub parent: Option<u32>,
+    pub cgroup: CgroupMatch,
+}
+
+/// Picks the candidate whose cgroup the game's traffic actually runs in.
 ///
-/// `overwatch_pid_from_ps` returns the *lowest* matching PID, and PIDs are
-/// handed out in ascending order — so a stale or long-lived process that merely
-/// resembles the game outranks the real one, which always has a high, recently
-/// allocated PID. Resolving every candidate and keeping the first with a
-/// plausible cgroup is what makes the live game win that race.
+/// Steam does not necessarily launch the game into the cgroup it launches it
+/// *from*. Measured on SteamOS 3.9.5 (2026-11-12): `steam-runtime-launch-client`
+/// and `steam-runtime-supervisor` sit in the Steam client's own unit,
+/// `app-steam@autostart.service`, and both carry the game's path in their
+/// command line. The game itself runs in a sibling scope,
+/// `app-steam-app2357570-<pid>.scope`. A rule scoped to the former is scoped to
+/// a sibling of the latter, not an ancestor, so it matches nothing the game
+/// sends — and blocking silently does nothing.
+///
+/// The launchers are ancestors of the game, so the deepest candidate in the
+/// process tree is the game (or a child of it). Ranking by depth rather than by
+/// PID keeps this right whatever order Steam allocates PIDs in, and it still
+/// picks the Steam client's unit in the older layout where the game ran
+/// directly under it. Depth is counted within the candidate set: the walk stops
+/// at the first ancestor that is not itself a candidate, which is all the
+/// ranking needs.
+pub fn select_game_candidate(candidates: &[GameCandidate]) -> Option<GameCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| is_game_cgroup(&candidate.cgroup))
+        .max_by_key(|candidate| (depth_within(candidates, candidate.pid), candidate.pid))
+        .cloned()
+}
+
+fn depth_within(candidates: &[GameCandidate], pid: u32) -> usize {
+    let mut depth = 0;
+    let mut current = pid;
+    // Bounded by the number of candidates: a cycle or a racing read must not
+    // turn into an unbounded walk.
+    for _ in 0..candidates.len() {
+        let Some(parent) = candidates
+            .iter()
+            .find(|candidate| candidate.pid == current)
+            .and_then(|candidate| candidate.parent)
+        else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+        depth += 1;
+    }
+    depth
+}
+
+/// Every matching process that has a readable cgroup.
 #[cfg(target_os = "linux")]
-pub fn running_game_cgroup() -> Option<CgroupMatch> {
+fn game_candidates() -> Vec<GameCandidate> {
     overwatch_pids()
         .into_iter()
-        .filter_map(cgroup_for_pid)
-        .find(is_game_cgroup)
+        .filter_map(|pid| {
+            Some(GameCandidate {
+                pid,
+                parent: parent_pid(pid),
+                cgroup: cgroup_for_pid(pid)?,
+            })
+        })
+        .collect()
+}
+
+/// The live game: a PID and the cgroup its traffic actually runs in.
+#[cfg(target_os = "linux")]
+fn live_game() -> Option<(u32, CgroupMatch)> {
+    select_game_candidate(&game_candidates()).map(|candidate| (candidate.pid, candidate.cgroup))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn running_game_cgroup() -> Option<CgroupMatch> {
+fn live_game() -> Option<(u32, CgroupMatch)> {
     None
+}
+
+/// The cgroup the game is running in.
+///
+/// Chosen by [`select_game_candidate`], not by taking the first plausible
+/// candidate: Steam's launch wrappers carry the game's path in their command
+/// line and are not in the game's cgroup.
+pub fn running_game_cgroup() -> Option<CgroupMatch> {
+    live_game().map(|(_, cgroup)| cgroup)
+}
+
+/// Reads a process's parent from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    parent_from_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Extracts the ppid field from `/proc/<pid>/stat`.
+///
+/// The comm field is parenthesised and may itself contain spaces and `)`, and
+/// the kernel does not escape it; the last `)` is the only safe split point.
+/// The fields after it are state, ppid, … in order, so ppid is the second one.
+fn parent_from_stat(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 /// The lowest PID whose command line looks like the game.
@@ -224,9 +316,15 @@ pub fn overwatch_pid() -> Option<u32> {
 /// `stat` on a mount that is being torn down is uninterruptible, which would
 /// wedge the calling thread through a shutdown rather than merely slow it.
 pub fn game_state() -> (Option<u32>, Option<CgroupMatch>) {
-    let game_pid = overwatch_pid();
-    let cgroup = game_pid.and_then(cgroup_for_pid);
-    (game_pid, cgroup)
+    // The same selection the watcher uses, so the window's "process tree" line
+    // and the manual Apply button name the cgroup the rules are actually
+    // scoped to, not a launcher's.
+    match live_game() {
+        Some((pid, cgroup)) => (Some(pid), Some(cgroup)),
+        // Still report the PID so the window can say the game is running even
+        // when its cgroup could not be read.
+        None => (overwatch_pid(), None),
+    }
 }
 
 /// Picks the cgroup v2 path out of `/proc/<pid>/cgroup` contents.
@@ -402,5 +500,106 @@ mod tests {
         assert!(!looks_like_overwatch("/usr/bin/firefox"));
         // The OldGame folder is not the game.
         assert!(!looks_like_overwatch("_retail_/OldGame.exe"));
+    }
+
+    /// Measured on SteamOS 3.9.5, 2026-11-12, while Overwatch was running.
+    const STEAM_SERVICE: &str =
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam@autostart.service";
+    const GAME_SCOPE: &str =
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam-app2357570-32396.scope";
+
+    fn candidate(pid: u32, parent: Option<u32>, path: &str) -> GameCandidate {
+        GameCandidate {
+            pid,
+            parent,
+            cgroup: CgroupMatch::from_path(path).unwrap(),
+        }
+    }
+
+    #[test]
+    fn steam_launch_wrappers_do_not_hide_the_game_scope() {
+        // The measured failure: the first two carry Overwatch's path in their
+        // command line but live in the Steam client's unit. The old lowest-PID
+        // rule picked 32392 and scoped every rule to a sibling of the game.
+        let candidates = [
+            candidate(32392, Some(2911), STEAM_SERVICE),
+            candidate(32395, Some(2816), STEAM_SERVICE),
+            candidate(32396, Some(32395), GAME_SCOPE),
+            candidate(32397, Some(32396), GAME_SCOPE),
+            candidate(32466, Some(32397), GAME_SCOPE),
+            candidate(32490, Some(32466), GAME_SCOPE),
+            candidate(32496, Some(32490), GAME_SCOPE),
+            candidate(32604, Some(32466), GAME_SCOPE),
+        ];
+        let picked = select_game_candidate(&candidates).unwrap();
+        assert_eq!(picked.cgroup.path, GAME_SCOPE.trim_start_matches('/'));
+        assert_ne!(picked.cgroup.path, STEAM_SERVICE.trim_start_matches('/'));
+    }
+
+    #[test]
+    fn the_older_layout_still_scopes_to_the_steam_client() {
+        // Before Steam started giving each launch a scope, the game ran under
+        // the client's unit. Depth must not lose that case.
+        let candidates = [
+            candidate(100, Some(1), STEAM_SERVICE),
+            candidate(101, Some(100), STEAM_SERVICE),
+        ];
+        assert_eq!(
+            select_game_candidate(&candidates).unwrap().cgroup.path,
+            STEAM_SERVICE.trim_start_matches('/')
+        );
+    }
+
+    #[test]
+    fn a_candidate_outside_a_steam_app_scope_is_ignored() {
+        let candidates = [
+            candidate(
+                4000,
+                Some(1),
+                "/user.slice/user-1000.slice/user@1000.service/session.slice",
+            ),
+            candidate(4001, Some(4000), GAME_SCOPE),
+        ];
+        assert_eq!(select_game_candidate(&candidates).unwrap().pid, 4001);
+    }
+
+    #[test]
+    fn no_plausible_cgroup_means_no_scope() {
+        let candidates = [candidate(
+            4000,
+            None,
+            "/user.slice/user-1000.slice/user@1000.service/session.slice",
+        )];
+        assert!(select_game_candidate(&candidates).is_none());
+        assert!(select_game_candidate(&[]).is_none());
+    }
+
+    #[test]
+    fn the_deeper_chain_wins() {
+        // A stale launch and the live one in another scope: the live game's
+        // chain is the deeper of the two, so it wins regardless of PID order.
+        let stale = "/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam-app2357570-1000.scope";
+        let candidates = [
+            candidate(1000, Some(1), stale),
+            candidate(2000, Some(1), GAME_SCOPE),
+            candidate(2001, Some(2000), GAME_SCOPE),
+        ];
+        assert_eq!(select_game_candidate(&candidates).unwrap().pid, 2001);
+    }
+
+    #[test]
+    fn the_parent_field_survives_a_hostile_comm() {
+        // comm is not escaped and may contain spaces and ')'. The last ')' is
+        // the split point; ppid is the second field after it.
+        assert_eq!(
+            parent_from_stat("123 (a) tricky ) name) S 4242 123 123 0 -1"),
+            Some(4242)
+        );
+        assert_eq!(
+            parent_from_stat("123 (Overwatch.exe) S 1 123 123 0"),
+            Some(1)
+        );
+        assert_eq!(parent_from_stat("not a stat line"), None);
+        assert_eq!(parent_from_stat(""), None);
     }
 }
