@@ -19,6 +19,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The lint steps below need these; naming them explicitly does not
+          # depend on the action's default profile.
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -32,6 +36,31 @@ jobs:
             libx11-dev libxcb1-dev libxkbcommon-dev \
             libxrandr-dev libxi-dev libxcursor-dev \
             libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
+
+      # Lint lives in this job, not a tag-only one: these failures should surface
+      # on every pull request and push, which is where they are cheap. The
+      # release job depends on this one, so a tag cannot publish un-linted code
+      # either.
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: shellcheck the installers
+        run: shellcheck -s sh install.sh packaging/install.sh run.sh
+
+      - name: syntax-check the on-device scripts
+        run: |
+          set -eu
+          for script in scripts/*.sh scripts/lib/*.sh; do
+            bash -n "$script"
+          done
+          # Info-level findings are not failures here: SC2015's `a && b || c`
+          # idiom is used deliberately for the PASS/FAIL lines. Warnings are.
+          # -x follows the shared fixture so the sourced helpers are known to
+          # the scripts that use them, rather than treated as external.
+          shellcheck -x -s bash -S warning scripts/*.sh scripts/lib/*.sh
 
       - name: test
         run: cargo test --all-targets
@@ -209,23 +238,58 @@ jobs:
       # The only automated proof that the installer's preflight works, and it is
       # safe on a runner precisely because the preflight runs before any
       # mutation: no systemctl, no nft, nothing that needs a real systemd.
-      - name: a missing binary must fail before anything is installed
+      - name: a missing piece must fail before anything is installed
         run: |
           set -eu
           version=${GITHUB_REF_NAME#v}
           stage=dropship-steamos-$version
+          work=$(mktemp -d)
 
-          # The GUI path is deliberately wrong. A download missing a binary has
-          # to fail in the first second, not after /etc and /var/lib have been
-          # written and the report claims a launcher entry that does not exist.
-          if sudo env DROPSHIP_STEAMOS_HELPER="$PWD/unpacked/$stage/dropship-steamos-helper" \
-                      DROPSHIP_STEAMOS_GUI=/nonexistent \
-                      "unpacked/$stage/packaging/install.sh" >/dev/null 2>&1
-          then
-            echo "the installer accepted a missing GUI binary" >&2
-            exit 1
-          fi
-          test ! -e /etc/systemd/system/dropship-steamos.service
+          # detect_desktop_user() takes SUDO_USER, which sudo sets to this
+          # runner, so these are the launcher paths the installer would write.
+          desktop_home=$(getent passwd "$(id -un)" | cut -d: -f6)
+          gui_dir=$desktop_home/.local/lib/dropship-steamos
+          launcher=$desktop_home/.local/share/applications/dropship-steamos.desktop
+
+          assert_nothing_written() {
+            if [ -e /etc/systemd/system/dropship-steamos.service ]; then
+              echo "the unit was written despite a failed preflight" >&2
+              exit 1
+            fi
+            if [ -e /var/lib/dropship-steamos ]; then
+              echo "/var/lib/dropship-steamos was created despite a failed preflight" >&2
+              exit 1
+            fi
+            if [ -e "$gui_dir" ] || [ -e "$launcher" ]; then
+              echo "the launcher was installed despite a failed preflight" >&2
+              exit 1
+            fi
+          }
+
+          install_should_fail() { # <name> <helper path> <gui path>
+            if sudo env DROPSHIP_STEAMOS_HELPER="$2" DROPSHIP_STEAMOS_GUI="$3" \
+                        "unpacked/$stage/packaging/install.sh" \
+                        >"$work/$1.out" 2>"$work/$1.err"
+            then
+              echo "the installer accepted a missing $1" >&2
+              exit 1
+            fi
+            # A bare exit status could be anything. The preflight has to have
+            # said why, so a future broken check fails loudly instead of passing
+            # on a coincidental error.
+            if ! grep -q 'the install is incomplete' "$work/$1.err"; then
+              echo "the $1 failure did not name the incomplete install:" >&2
+              cat "$work/$1.err" >&2
+              exit 1
+            fi
+            assert_nothing_written
+          }
+
+          # Both halves of the payload preflight, not just the GUI.
+          install_should_fail gui-missing \
+            "$PWD/unpacked/$stage/dropship-steamos-helper" /nonexistent
+          install_should_fail helper-missing \
+            /nonexistent "$PWD/unpacked/$stage/dropship-steamos"
 
       - name: publish the release
         env:

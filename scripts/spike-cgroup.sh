@@ -16,6 +16,10 @@
 
 set -uo pipefail
 
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=scripts/lib/deck-fixture.sh
+. "$REPO/scripts/lib/deck-fixture.sh"
+
 TABLE=dropship_spike
 GAME_PATTERN="overwatch.exe"
 DO_DROP=0
@@ -61,10 +65,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-as_root() {
-  if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
-}
-
 # --------------------------------------------------------------- pure helpers
 
 # /proc/<pid>/cgroup -> cgroup v2 path with the leading slash removed, or empty.
@@ -98,9 +98,80 @@ ancestor_of() {
   }'
 }
 
+# Whether a cgroup is one the game could plausibly run in. Mirrors
+# src/steam.rs `is_game_cgroup`: an app.slice segment and some segment naming
+# Steam, case-insensitively. Deliberately loose, exactly like the Rust side —
+# tightening it would need Game Mode's shape, which was never measured.
+is_game_cgroup() {
+  local path=$1 segment lower
+  local -a segments=()
+  local in_app_slice=0 names_steam=0
+  IFS=/ read -r -a segments <<< "$path"
+  for segment in "${segments[@]}"; do
+    [ "$segment" = "app.slice" ] && in_app_slice=1
+    lower=$(printf '%s' "$segment" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+      *steam*) names_steam=1 ;;
+    esac
+  done
+  [ "$in_app_slice" -eq 1 ] && [ "$names_steam" -eq 1 ]
+}
+
+# ppid from /proc/<pid>/stat. The comm field is parenthesised and may itself
+# contain spaces or ')', so split after the *last* ')'; the fields after it are
+# state, ppid, … in order. Same rule as src/steam.rs `parent_from_stat`.
+parent_pid() {
+  local stat fields
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  read -r -a fields <<< "${stat##*)}"
+  printf '%s' "${fields[1]:-}"
+}
+
+# The deepest candidate whose cgroup looks like the game's, ties going to the
+# highest PID. Mirrors src/steam.rs `select_game_candidate` and
+# `depth_within`.
+#
+# This matters: Steam's launch helpers carry the game's path in their command
+# line — measured on SteamOS 3.9.5, `steam-runtime-launch-client` and
+# `steam-runtime-supervisor` both match "overwatch.exe" — but they sit in the
+# Steam client's cgroup, a sibling of the game's per-launch scope. Taking the
+# first `ps` match labels a launcher as the game, and a rule scoped there
+# matches nothing the game sends. The game is an ancestor's descendant, so depth
+# within the candidate set is what tells them apart.
 game_pid() {
-  ps -eo pid=,args= 2>/dev/null \
-    | awk -v pat="$GAME_PATTERN" 'tolower($0) ~ pat { print $1; exit }'
+  local pid cg parent best_pid="" best_depth=-1 depth current i
+  local -a candidates=()
+  local -A parents=()
+
+  for pid in $(ps -eo pid=,args= 2>/dev/null | awk -v pat="$GAME_PATTERN" 'tolower($0) ~ pat { print $1 }'); do
+    cg=$(cgroup_path_of "$pid")
+    [ -n "$cg" ] || continue
+    is_game_cgroup "$cg" || continue
+    candidates+=("$pid")
+    parents[$pid]=$(parent_pid "$pid")
+  done
+
+  for pid in "${candidates[@]}"; do
+    depth=0
+    current=$pid
+    # Bounded by the candidate count, as in the Rust walk: a cycle or a racing
+    # read must not become an unbounded loop.
+    for (( i = 0; i < ${#candidates[@]}; i++ )); do
+      parent=${parents[$current]:-}
+      [ -n "$parent" ] || break
+      [ -n "${parents[$parent]+x}" ] || break
+      [ "$parent" = "$current" ] && break
+      current=$parent
+      depth=$((depth + 1))
+    done
+    if [ "$depth" -gt "$best_depth" ] ||
+       { [ "$depth" -eq "$best_depth" ] && { [ -z "$best_pid" ] || [ "$pid" -gt "$best_pid" ]; }; }; then
+      best_pid=$pid
+      best_depth=$depth
+    fi
+  done
+
+  [ -n "$best_pid" ] && printf '%s' "$best_pid"
 }
 
 # Sum of `packets` across rules carrying the given comment.
@@ -123,25 +194,9 @@ add_scoped_rule() { # <level> <path> <comment> <counter|drop> [extra match…]
 add_scoped_counter() { add_scoped_rule "$1" "$2" "$3" counter "${@:4}"; }
 add_scoped_drop() { add_scoped_rule "$1" "$2" "$3" drop "${@:4}"; }
 
-# HTTP status code seen by a curl running *inside* the given cgroup, or empty if
-# the process could not be moved there at all.
-#
-# The probe moves itself into the cgroup and only then execs curl. Doing it the
-# other way round — background a curl and write its PID into cgroup.procs —
-# races the fork: the shell spawns curl immediately, so curl may open its socket
-# in the parent's cgroup and the rule would miss it. nft matches the cgroup the
-# socket was created in, so the move has to land before the first connect.
-probe_in_cgroup() { # <cgroup path> <ip>
-  local probe
-  probe=$(mktemp) || return 1
-  cat > "$probe" <<'EOS'
-#!/bin/sh
-echo $$ > "/sys/fs/cgroup/$1/cgroup.procs" || exit 3
-exec curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$2"
-EOS
-  as_root sh "$probe" "$1" "$2" 2>/dev/null
-  rm -f "$probe"
-}
+# `probe_in_cgroup` lives in scripts/lib/deck-fixture.sh, shared with
+# cgroup-recreate-test.sh: the in-cgroup HTTP probe has to move itself into the
+# cgroup before exec, and two copies of that race-sensitive trick would drift.
 
 # One packets value per ancestor level, space separated.
 read_levels() {

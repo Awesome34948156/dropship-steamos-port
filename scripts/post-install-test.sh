@@ -20,53 +20,62 @@
 # cannot leave drop rules behind with nothing left running to remove them.
 #
 # Your region selection is backed up and restored; the service is left running.
+# The config directory, if it does not exist, is created as the desktop user and
+# removed again in cleanup: a root-owned ~/.config/dropship-steamos would stop
+# the GUI (which runs as that user) from saving anything afterwards.
 set -u
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
+
+# Derived from this script's own location so it works from any checkout.
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=scripts/lib/deck-fixture.sh
+. "$REPO/scripts/lib/deck-fixture.sh"
 
 UNIT=dropship-steamos.service
 LIB=/var/lib/dropship-steamos
 HELPER=$LIB/dropship-steamos-helper
-CONFIG=/home/deck/.config/dropship-steamos/service.json
+CONFIG=$DESKTOP_HOME/.config/dropship-steamos/service.json
+CONFIG_DIR=$(dirname "$CONFIG")
 BACKUP=$CONFIG.before-post-install-test
-SCOPE=app-steam-app2357570-99999
-SCOPE_DIR=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice
-V4=192.0.2.0/24
-V6=2001:db8::/32
 
-pass=0
-fail=0
-ok()   { echo "  PASS  $*"; pass=$((pass + 1)); }
-bad()  { echo "  FAIL  $*"; fail=$((fail + 1)); }
-step() { echo; echo "== $* =="; }
+now_ms() { date +%s%3N; }
 
 [ "$(id -u)" -eq 0 ] || { echo "run this with sudo"; exit 1; }
 
-table_present() { nft list table inet dropship_steamos >/dev/null 2>&1; }
-as_deck() { runuser -u deck -- env XDG_RUNTIME_DIR=/run/user/1000 "$@"; }
-now_ms() { date +%s%3N; }
+# Remember what the config directory looked like before the test, so cleanup can
+# put it back rather than leaving root's ownership or deleting the user's data.
+config_dir_existed=0
+config_dir_owner=
+config_dir_mode=
+if [ -d "$CONFIG_DIR" ]; then
+    config_dir_existed=1
+    config_dir_owner=$(stat -c '%u:%g' "$CONFIG_DIR" 2>/dev/null)
+    config_dir_mode=$(stat -c '%a' "$CONFIG_DIR" 2>/dev/null)
+fi
+config_written=0
+restored=0
+CONFIG_TMP=
 
-start_game() {
-    as_deck systemctl --user stop "$SCOPE.scope" 2>/dev/null
-    as_deck systemctl --user reset-failed "$SCOPE.scope" 2>/dev/null
-    as_deck systemd-run --user --scope --unit="$SCOPE" --collect \
-        bash -c 'exec -a Overwatch.exe sleep 300' >/dev/null 2>&1 &
-    for _ in $(seq 1 30); do
-        pgrep -f 'Overwatch\.exe' >/dev/null && return 0
-        sleep 0.2
-    done
-    return 1
-}
-
-stop_game() {
-    pkill -f 'Overwatch\.exe' 2>/dev/null
-    as_deck systemctl --user stop "$SCOPE.scope" 2>/dev/null
-    for _ in $(seq 1 30); do pgrep -f 'Overwatch\.exe' >/dev/null || return 0; sleep 0.2; done
-    return 1
+restore_config_dir() {
+    if [ "$config_dir_existed" -eq 1 ]; then
+        [ -n "$config_dir_owner" ] && chown "$config_dir_owner" "$CONFIG_DIR" 2>/dev/null
+        [ -n "$config_dir_mode" ] && chmod "$config_dir_mode" "$CONFIG_DIR" 2>/dev/null
+    else
+        # Only if it is empty: anything left in it belongs to the user.
+        rmdir "$CONFIG_DIR" 2>/dev/null || true
+    fi
 }
 
 cleanup() {
     stop_game >/dev/null 2>&1
-    if [ -f "$BACKUP" ]; then mv -f "$BACKUP" "$CONFIG"; fi
+    if [ -n "$CONFIG_TMP" ]; then rm -f "$CONFIG_TMP"; fi
+    if [ "$restored" -eq 0 ]; then
+        if [ "$config_written" -eq 1 ]; then
+            if [ -f "$BACKUP" ]; then mv -f "$BACKUP" "$CONFIG"; else rm -f "$CONFIG"; fi
+        fi
+        restored=1
+    fi
+    restore_config_dir
     systemctl start "$UNIT" 2>/dev/null
 }
 trap cleanup EXIT
@@ -100,8 +109,8 @@ if [ -f "$desktop" ]; then
     desktop_owner=$(stat -c '%U:%G' "$desktop")
     # Written as the desktop user on purpose: a root-owned file in the home
     # directory is a mess that outlives the uninstall.
-    [ "$desktop_owner" = "deck:deck" ] && ok "the launcher entry is owned by deck, not root" \
-        || bad "the launcher entry is $desktop_owner; expected deck:deck"
+    [ "$desktop_owner" = "$DESKTOP_USER:$DESKTOP_GROUP" ] && ok "the launcher entry is owned by $DESKTOP_USER, not root" \
+        || bad "the launcher entry is $desktop_owner; expected $DESKTOP_USER:$DESKTOP_GROUP"
     grep -q '^Icon=.*game-icon-overwatch.svg' "$desktop" \
         && ok "the launcher entry points at an icon that exists" \
         || bad "the launcher entry's Icon= does not point at the installed icon"
@@ -122,12 +131,21 @@ as_deck systemctl is-active --quiet "$UNIT" && ok "deck can query it without roo
 # ------------------------------------------------- the capability question
 step "nft works under the unit's hardening — the thing only systemd can answer"
 [ -f "$CONFIG" ] && cp -a "$CONFIG" "$BACKUP"
-mkdir -p "$(dirname "$CONFIG")"
-cat > "$CONFIG" <<JSON
+# Created as the desktop user, not root. This directory usually already exists
+# (the GUI makes it), but when it does not, leaving it root-owned would break
+# saving from the GUI long after this test has finished.
+install -d -o "$DESKTOP_USER" -g "$DESKTOP_GROUP" -m 0755 "$CONFIG_DIR"
+# Staged in a root-only file and copied into place, rather than a root shell
+# redirect into a user-owned directory.
+CONFIG_TMP=$(mktemp)
+cat > "$CONFIG_TMP" <<JSON
 { "version": 1, "enabled": true, "revision": 900001,
   "ipv4": ["$V4"], "ipv6": ["$V6"] }
 JSON
-chmod 0644 "$CONFIG"
+install -o "$DESKTOP_USER" -g "$DESKTOP_GROUP" -m 0644 "$CONFIG_TMP" "$CONFIG"
+rm -f "$CONFIG_TMP"
+CONFIG_TMP=
+config_written=1
 
 nft delete table inet dropship_steamos 2>/dev/null
 systemctl restart "$UNIT"
@@ -194,6 +212,8 @@ else
     rm -f "$CONFIG"
     ok "no selection to restore; the test config was removed"
 fi
+restored=1
+restore_config_dir
 
 step "summary"
 echo "$pass passed, $fail failed"

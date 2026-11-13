@@ -29,9 +29,9 @@ Open Konsole and run:
 
 ```sh
 cd ~/Downloads
+sha256sum -c SHA256SUMS
 tar -xzf dropship-steamos-<version>-linux-x86_64.tar.gz
 cd dropship-steamos-<version>
-sha256sum -c SHA256SUMS
 sudo ./install.sh
 ```
 

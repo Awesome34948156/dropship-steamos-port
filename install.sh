@@ -34,20 +34,26 @@ here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 helper=$here/dropship-steamos-helper
 gui=$here/dropship-steamos
 
-# Also checked by the installer's own preflight. Kept here because this is the
-# one place that knows the user is looking at a tarball, and so can name the
-# checkout command as the alternative. The installer can only say "these files
-# are missing"; this can say "you probably wanted the other entry point".
-[ -x "$helper" ] || {
-    echo "error: no helper binary beside this script ($helper)" >&2
-    echo "       from a checkout, run: sudo packaging/install.sh" >&2
-    exit 1
-}
-[ -x "$gui" ] || {
-    echo "error: no app binary beside this script ($gui)" >&2
-    echo "       from a checkout, run: sudo packaging/install.sh" >&2
-    exit 1
-}
+# Uninstalling needs no payload, so the checks below are skipped for it: after a
+# release has been cleaned out from under the tarball, `sudo ./install.sh
+# --uninstall` still has to work. The installer's own preflight is not reached
+# on the uninstall path either.
+if [ "${1:-}" != "--uninstall" ]; then
+    # Also checked by the installer's own preflight. Kept here because this is the
+    # one place that knows the user is looking at a tarball, and so can name the
+    # checkout command as the alternative. The installer can only say "these files
+    # are missing"; this can say "you probably wanted the other entry point".
+    [ -x "$helper" ] || {
+        echo "error: no helper binary beside this script ($helper)" >&2
+        echo "       from a checkout, run: sudo packaging/install.sh" >&2
+        exit 1
+    }
+    [ -x "$gui" ] || {
+        echo "error: no app binary beside this script ($gui)" >&2
+        echo "       from a checkout, run: sudo packaging/install.sh" >&2
+        exit 1
+    }
+fi
 
 export DROPSHIP_STEAMOS_HELPER="$helper"
 export DROPSHIP_STEAMOS_GUI="$gui"

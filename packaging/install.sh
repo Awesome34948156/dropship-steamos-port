@@ -33,6 +33,17 @@ SERVICE_USER_HOME_CONFIG=.config/dropship-steamos/service.json
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# Templates are expanded into root-only temp files and then `install`ed into
+# place, rather than a root shell redirect writing into a path that the desktop
+# user can replace with a symlink. mktemp's 0600 mode is deliberate.
+UNIT_TMP=
+DESKTOP_TMP=
+cleanup_temps() {
+    if [ -n "$UNIT_TMP" ]; then rm -f "$UNIT_TMP"; fi
+    if [ -n "$DESKTOP_TMP" ]; then rm -f "$DESKTOP_TMP"; fi
+}
+trap cleanup_temps EXIT
+
 [ "$(id -u)" -eq 0 ] || die "run this with sudo: sudo $0 $*"
 
 REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -116,9 +127,11 @@ install_service() {
     install -o root -g root -m 0755 "$HELPER_SRC" "$LIB_DIR/dropship-steamos-helper"
 
     say "Installing $UNIT"
-    sed "s|@CONFIG@|$CONFIG_PATH|g" "$REPO/packaging/$UNIT" > "$UNIT_DIR/$UNIT"
-    chown root:root "$UNIT_DIR/$UNIT"
-    chmod 0644 "$UNIT_DIR/$UNIT"
+    UNIT_TMP=$(mktemp)
+    sed "s|@CONFIG@|$CONFIG_PATH|g" "$REPO/packaging/$UNIT" > "$UNIT_TMP"
+    install -o root -g root -m 0644 "$UNIT_TMP" "$UNIT_DIR/$UNIT"
+    rm -f "$UNIT_TMP"
+    UNIT_TMP=
 
     systemctl daemon-reload
     systemctl enable "$UNIT"
@@ -145,15 +158,20 @@ install_launcher() {
         "$ICON_SRC" "$gui_dir/game-icon-overwatch.svg"
 
     # Written as the desktop user, not as root: a root-owned file inside the
-    # home directory is a small mess that outlives the uninstall.
+    # home directory is a small mess that outlives the uninstall. Expanded in a
+    # root-only temp file first, so a symlink planted at the destination cannot
+    # redirect a root write.
     install -d -o "$DESKTOP_USER" -g "$DESKTOP_GROUP" -m 0755 "$apps_dir"
+    DESKTOP_TMP=$(mktemp)
     sed -e "s|@HELPER@|$LIB_DIR/dropship-steamos-helper|g" \
         -e "s|@GUI@|$gui_dir/dropship-steamos|g" \
         -e "s|@ICON@|$gui_dir/game-icon-overwatch.svg|g" \
         "$REPO/packaging/dropship-steamos.desktop" \
-        > "$apps_dir/dropship-steamos.desktop"
-    chown "$DESKTOP_USER:$DESKTOP_GROUP" "$apps_dir/dropship-steamos.desktop"
-    chmod 0644 "$apps_dir/dropship-steamos.desktop"
+        > "$DESKTOP_TMP"
+    install -o "$DESKTOP_USER" -g "$DESKTOP_GROUP" -m 0644 \
+        "$DESKTOP_TMP" "$apps_dir/dropship-steamos.desktop"
+    rm -f "$DESKTOP_TMP"
+    DESKTOP_TMP=
 }
 
 report() {

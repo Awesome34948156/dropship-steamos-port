@@ -4,12 +4,12 @@ An in-progress, native SteamOS server selector for Overwatch 2. It uses the publ
 
 ## Install from a release
 
-If you just want to run this on a Steam Deck, you do not need a Rust toolchain. Take the archive from [Releases](https://github.com/Awesome34948156/dropship-steamos-port/releases) — it contains both binaries, the installer and the icon.
+If you just want to run this on a Steam Deck, you do not need a Rust toolchain. Take the archive and its separate `SHA256SUMS` from [Releases](https://github.com/Awesome34948156/dropship-steamos-port/releases). The archive contains both binaries, the installer and the icon. Download both files into the same directory, then:
 
 ```sh
+sha256sum -c SHA256SUMS      # optional; verifies the archive beside it
 tar -xzf dropship-steamos-<version>-linux-x86_64.tar.gz
 cd dropship-steamos-<version>
-sha256sum -c SHA256SUMS      # optional; prints "...tar.gz: OK"
 sudo ./install.sh
 ```
 
@@ -70,14 +70,14 @@ sudo ./install.sh --uninstall             # from a release tarball
 Blocks are scoped to Overwatch's process tree with an nftables cgroup v2 match, so other applications on the device are never affected:
 
 ```
-socket cgroupv2 level 5 "user.slice/…/app.slice/app-steam-2357570.scope" ip daddr @blocked_ipv4 drop
+socket cgroupv2 level 5 "user.slice/…/app.slice/app-steam-app2357570-<pid>.scope" ip daddr @blocked_ipv4 drop
 ```
 
 The cgroup path is discovered from the live game process rather than hardcoded, and the `level` is derived from the depth of that path.
 
 A plan without a cgroup cannot be constructed at all: `RulePlan` requires one, so there is no code path — and no fallback — that can install a device-wide rule.
 
-In Desktop Mode the game shares Steam's own cgroup, so the scope covers the Steam client too. Only traffic *to the blocked ranges* is dropped, and Steam talks to Valve rather than to Blizzard's game servers, so the overlap is close to nothing in practice. Automatic blocking narrows this further by removing the rules whenever the game is not running.
+SteamOS 3.9.5 launches the game in its own per-launch scope (`app-steam-app2357570-<pid>.scope`); older layouts ran it under the Steam client's own unit (`app-steam@autostart.service`). The scope is discovered from the live game process, so both layouts work without a mode switch. In the older layout the scope also covers the Steam client; only traffic *to the blocked ranges* is dropped, and Steam talks to Valve rather than to Blizzard's game servers, so the overlap is close to nothing in practice. Automatic blocking narrows this further by removing the rules whenever the game is not running.
 
 **Requirements:** kernel ≥ 5.13 and nftables ≥ 0.9.9 for cgroup v2 matching.
 
@@ -87,7 +87,7 @@ Without the service installed, the app applies blocks by hand instead: **Apply b
 
 One subtlety the app handles for you: restarting Steam rebuilds the game's cgroup at an *identical path*, and nftables resolves a cgroup when the rule is added rather than tracking the path. The app records the cgroup's inode alongside its path, so it can tell that a rule no longer matches anything and prompt you to re-apply.
 
-Because rules are scoped to a cgroup that is destroyed when the game exits, a rule left in place after the game closes is inert rather than harmful.
+With the per-launch scope SteamOS 3.9.5 uses, a rule left in place after the game closes is inert rather than harmful — the cgroup is gone. In the older layout, where the game shares Steam's persistent client cgroup, a leftover rule can still match Steam's own traffic, which is why the service removes rules after a quit.
 
 ## Surviving SteamOS updates
 
@@ -109,7 +109,7 @@ DROPSHIP_STEAMOS_HELPER="$PWD/target/debug/dropship-steamos-helper" cargo run --
 
 `packaging/install.sh` takes those same two variables to install from somewhere other than `target/release/`. `DROPSHIP_HELPER` and `DROPSHIP_GUI` also work there as older spellings, but the `DROPSHIP_STEAMOS_*` names are the ones the rest of the repo and the installed launcher entry use, and the ones to reach for.
 
-The helper is the only privileged entry point and accepts exactly three verbs: `apply` and `disable`, which the manual UI reaches over `pkexec`, and `watch --config <absolute path>`, which the service runs. It only ever creates or removes the `inet dropship_steamos` nftables table, and `apply`/`disable` refuse to run while the watcher holds its lock.
+The helper is the only privileged entry point and accepts exactly three verbs: `apply` and `disable`, which the manual UI reaches over `pkexec`, and `watch --config <absolute path>`, which the service runs. It only ever creates or removes the `inet dropship_steamos` nftables table. `apply` refuses to run while the watcher holds its lock, so two writers cannot race for the table; `disable` deliberately does not, because it has to work at exactly the moment the service is being stopped.
 
 The installed launcher entry is the normal way to start the app on the Deck. To watch stderr instead, `./run.sh` launches the same binaries from the terminal — but it has to be a terminal **inside the desktop session**, not an SSH shell. The window needs `WAYLAND_DISPLAY`, and the manual Apply path needs the session bus so KDE's polkit agent can answer the prompt; over SSH both are absent.
 
@@ -127,7 +127,7 @@ sudo ./target/debug/dropship-steamos-helper watch --config "$HOME/.config/dropsh
 |---|---|
 | `spike-cgroup.sh` | Do the kernel and nft do what the design assumes? Run with Overwatch in **Game Mode**; `--drop` proves a scoped drop actually cuts traffic. |
 | `cgroup-recreate-test.sh` | Does an nft cgroupv2 rule survive its cgroup being destroyed and recreated? The hazard that makes a Steam restart dangerous. |
-| `watcher-test.sh` | Does the watcher's cycle work — apply on launch, remove on exit, re-apply after the cgroup is recreated? Drives the binary alone, so it passes even when the unit is broken. |
+| `watcher-test.sh` | Does the watcher's cycle work — apply on launch, re-apply when the selection changes, remove on exit, re-apply after the cgroup is recreated? Stops the installed unit first and starts it again afterwards, then drives the binary alone, so it passes even when the unit is broken. |
 | `post-install-test.sh` | Does the **installed service** work under systemd's hardening? The only one that can catch a sandbox mistake, because it goes through the unit. |
 | `diagnose-service.sh` | The service is active but never applies. Bisects the hardening directives until one is named. |
 

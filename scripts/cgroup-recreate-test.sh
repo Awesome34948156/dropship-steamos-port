@@ -14,11 +14,13 @@
 
 set -uo pipefail
 
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=scripts/lib/deck-fixture.sh
+. "$REPO/scripts/lib/deck-fixture.sh"
+
 TABLE=dropship_recreate_probe
 CG=zz_dropship_probe_cgroup
 TEST_IP=1.1.1.1
-
-as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 
 cleanup() {
   as_root nft delete table inet "$TABLE" 2>/dev/null
@@ -26,21 +28,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# HTTP status from a curl running inside the cgroup, or empty if it could not
-# join. The shell moves itself in and only then execs curl, so the socket is
-# created inside the cgroup; doing it the other way round races the fork.
-probe() { # <cgroup> <ip>
-  local script
-  script=$(mktemp) || return 1
-  cat > "$script" <<'EOS'
-#!/bin/sh
-echo $$ > "/sys/fs/cgroup/$1/cgroup.procs" || exit 3
-exec curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$2"
-EOS
-  as_root sh "$script" "$1" "$2" 2>/dev/null
-  rm -f "$script"
-}
-
+# The in-cgroup probe lives in scripts/lib/deck-fixture.sh, shared with
+# spike-cgroup.sh: the shell has to move itself into the cgroup before exec, or
+# the fork races the cgroup write.
 inode_of() { as_root stat -c '%i' "/sys/fs/cgroup/$CG" 2>/dev/null; }
 
 echo "1. create /sys/fs/cgroup/$CG"
@@ -63,7 +53,7 @@ fi
 
 echo
 echo "3. probe from inside the cgroup — the rule must bite (expect 000)"
-BEFORE=$(probe "$CG" "$TEST_IP")
+BEFORE=$(probe_in_cgroup "$CG" "$TEST_IP")
 echo "   HTTP ${BEFORE:-<could not join>}"
 
 echo
@@ -77,7 +67,7 @@ echo "   inode $(inode_of)  (different inode means a genuinely new cgroup)"
 
 echo
 echo "5. probe again from the recreated cgroup"
-AFTER=$(probe "$CG" "$TEST_IP")
+AFTER=$(probe_in_cgroup "$CG" "$TEST_IP")
 echo "   HTTP ${AFTER:-<could not join>}"
 
 echo

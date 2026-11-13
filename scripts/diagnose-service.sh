@@ -11,49 +11,33 @@
 # until it starts working. That names the directive responsible instead of
 # guessing at it.
 #
-# Nothing here changes the install. The service is stopped while the probe runs
-# (two watchers cannot both hold the lock) and started again at the end.
+# Nothing here changes the install, and it never reads or writes your real
+# service.json: the probe gets a config of its own. The service is stopped while
+# the probe runs (two watchers cannot both hold the lock) and started again at
+# the end.
 set -u
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
 
+# Derived from this script's own location so it works from any checkout.
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=scripts/lib/deck-fixture.sh
+. "$REPO/scripts/lib/deck-fixture.sh"
+
 UNIT=dropship-steamos.service
 HELPER=/var/lib/dropship-steamos/dropship-steamos-helper
-CONFIG=/home/deck/.config/dropship-steamos/service.json
-BACKUP=$CONFIG.before-diagnose
-DIAG_CONFIG=/tmp/dropship-diag-service.json
-SCOPE=app-steam-app2357570-99999
-V4=192.0.2.0/24
-V6=2001:db8::/32
+# Not /tmp: the probe units run with PrivateTmp=yes, so they see a private /tmp
+# and could never read a file the host wrote there. The desktop user's home is
+# visible to them under ProtectHome=read-only, and CAP_DAC_READ_SEARCH covers
+# the 0700 traversal. This is deliberately not the real config path.
+DIAG_CONFIG=$DESKTOP_HOME/dropship-diag-service.json
 
 [ "$(id -u)" -eq 0 ] || { echo "run this with sudo"; exit 1; }
 
-table_present() { nft list table inet dropship_steamos >/dev/null 2>&1; }
-as_deck() { runuser -u deck -- env XDG_RUNTIME_DIR=/run/user/1000 "$@"; }
-
-start_game() {
-    as_deck systemctl --user stop "$SCOPE.scope" 2>/dev/null
-    as_deck systemctl --user reset-failed "$SCOPE.scope" 2>/dev/null
-    as_deck systemd-run --user --scope --unit="$SCOPE" --collect \
-        bash -c 'exec -a Overwatch.exe sleep 300' >/dev/null 2>&1 &
-    for _ in $(seq 1 30); do pgrep -f 'Overwatch\.exe' >/dev/null && return 0; sleep 0.2; done
-    return 1
-}
-
-stop_game() {
-    pkill -f 'Overwatch\.exe' 2>/dev/null
-    as_deck systemctl --user stop "$SCOPE.scope" 2>/dev/null
-    for _ in $(seq 1 30); do pgrep -f 'Overwatch\.exe' >/dev/null || return 0; sleep 0.2; done
-    return 1
-}
-
-# Waits up to $1 seconds for the table to appear.
-wait_applied() {
-    for _ in $(seq 1 "$(( $1 * 5 ))"); do
-        table_present && return 0
-        sleep 0.2
-    done
-    return 1
-}
+# Root-run scratch: mktemp keeps the hand-run log out of a fixed, predictable
+# /tmp name.
+DIAG_DIR=$(mktemp -d)
+HAND_LOG=$DIAG_DIR/hand.log
+CONFIG_TMP=
 
 cleanup() {
     stop_game >/dev/null 2>&1
@@ -61,7 +45,8 @@ cleanup() {
     systemctl reset-failed ds-diag.service 2>/dev/null
     nft delete table inet dropship_steamos 2>/dev/null
     rm -f "$DIAG_CONFIG"
-    if [ -f "$BACKUP" ]; then mv -f "$BACKUP" "$CONFIG"; else rm -f "$CONFIG"; fi
+    if [ -n "$CONFIG_TMP" ]; then rm -f "$CONFIG_TMP"; fi
+    rm -rf "$DIAG_DIR"
     systemctl start "$UNIT" 2>/dev/null
 }
 trap cleanup EXIT
@@ -83,12 +68,16 @@ echo "############ 2. setting up ############"
 systemctl stop "$UNIT"
 stop_game >/dev/null 2>&1
 nft delete table inet dropship_steamos 2>/dev/null
-mkdir -p "$(dirname "$DIAG_CONFIG")"
-cat > "$DIAG_CONFIG" <<JSON
+# Staged in a root-only file and copied into place, rather than a root shell
+# redirect into a path under the desktop user's home.
+CONFIG_TMP=$(mktemp)
+cat > "$CONFIG_TMP" <<JSON
 { "version": 1, "enabled": true, "revision": 900002,
   "ipv4": ["$V4"], "ipv6": ["$V6"] }
 JSON
-chmod 0644 "$DIAG_CONFIG"
+install -o root -g root -m 0644 "$CONFIG_TMP" "$DIAG_CONFIG"
+rm -f "$CONFIG_TMP"
+CONFIG_TMP=
 echo "config written to $DIAG_CONFIG"
 start_game && echo "fake game is running" || echo "COULD NOT START THE FAKE GAME"
 
@@ -99,14 +88,13 @@ echo "############ 2b. can a sandboxed root process read /proc and run nft? ####
 # directly, under the same capability set the unit uses.
 systemctl reset-failed ds-probe.service 2>/dev/null
 systemd-run --unit=ds-probe --collect \
-    -p CapabilityBoundingSet=CAP_NET_ADMIN \
-    -p AmbientCapabilities=CAP_NET_ADMIN \
+    -p "CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH" \
+    -p "AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH" \
     -p NoNewPrivileges=yes \
     -p ProtectSystem=strict \
     -p ProtectHome=read-only \
     -p ProtectControlGroups=yes \
-    -p RestrictAddressFamilies=AF_NETLINK \
-    -p RestrictAddressFamilies=AF_UNIX \
+    -p "RestrictAddressFamilies=AF_NETLINK AF_UNIX" \
     -p Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin \
     /bin/sh -c '
         echo "uid=$(id -u), capabilities=$(grep CapEff /proc/self/status)"
@@ -132,7 +120,7 @@ systemctl reset-failed ds-probe.service 2>/dev/null
 echo
 echo "############ 3. the same binary, by hand (baseline) ############"
 nft delete table inet dropship_steamos 2>/dev/null
-"$HELPER" watch --config "$DIAG_CONFIG" > /tmp/dropship-diag-hand.log 2>&1 &
+"$HELPER" watch --config "$DIAG_CONFIG" > "$HAND_LOG" 2>&1 &
 HAND=$!
 if wait_applied 20; then
     echo "  RESULT: applied — the binary and the inputs are fine"
@@ -142,13 +130,15 @@ fi
 kill "$HAND" 2>/dev/null
 wait "$HAND" 2>/dev/null
 echo "  --- its log ---"
-sed 's/^/    /' /tmp/dropship-diag-hand.log
+sed 's/^/    /' "$HAND_LOG"
 nft delete table inet dropship_steamos 2>/dev/null
 
 # systemd applies every property the unit sets, for a like-for-like comparison.
+# Both capabilities and the runtime directory are here because they are in the
+# unit: a bisection that omits one asks a different question.
 common_props=(
-    -p CapabilityBoundingSet=CAP_NET_ADMIN
-    -p AmbientCapabilities=CAP_NET_ADMIN
+    -p "CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH"
+    -p "AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH"
     -p NoNewPrivileges=yes
     -p PrivateTmp=yes
     -p ProtectSystem=strict
@@ -158,9 +148,10 @@ common_props=(
     -p ProtectControlGroups=yes
     -p ProtectClock=yes
     -p RestrictNamespaces=yes
-    -p RestrictAddressFamilies=AF_NETLINK
-    -p RestrictAddressFamilies=AF_UNIX
+    -p "RestrictAddressFamilies=AF_NETLINK AF_UNIX"
     -p LockPersonality=yes
+    -p RuntimeDirectory=dropship-steamos
+    -p RuntimeDirectoryMode=0755
     -p Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
 )
 
@@ -194,9 +185,9 @@ full=$RESULT
 if [ "$full" = blocked ]; then
     echo
     echo "############ 5. bisecting: capabilities only ############"
-    run_sandboxed "CAP_NET_ADMIN only, no filesystem protection" \
-        -p CapabilityBoundingSet=CAP_NET_ADMIN \
-        -p AmbientCapabilities=CAP_NET_ADMIN \
+    run_sandboxed "both capabilities, no filesystem protection" \
+        -p "CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH" \
+        -p "AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH" \
         -p Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
     caps_only=$RESULT
 
@@ -221,4 +212,4 @@ fi
 
 echo
 echo "############ done ############"
-echo "The service has been restarted with your original configuration."
+echo "The service has been restarted. Your real service.json was never touched."
