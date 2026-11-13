@@ -41,9 +41,11 @@ pub fn path() -> Result<PathBuf> {
 pub fn parse(bytes: &[u8]) -> Result<Settings> {
     let mut settings: Settings =
         serde_json::from_slice(bytes).context("settings file is invalid")?;
-    // Zero is not a valid Steam app id. Treat it as "never set" so a file
-    // written by the version whose `Default` produced 0 repairs itself.
-    if settings.steam_app_id == 0 {
+    // Zero is what the version with a derived `Default` wrote. One is what the
+    // UI's `1..=u32::MAX` drag range clamped that zero to the first time the
+    // field was touched. Neither is a usable app id here, so both mean "never
+    // set" and repair themselves on load.
+    if settings.steam_app_id <= 1 {
         settings.steam_app_id = default_steam_app_id();
     }
     Ok(settings)
@@ -82,6 +84,16 @@ mod tests {
         // Older builds wrote this after the derived Default leaked out.
         assert_eq!(
             parse(br#"{"steam_app_id":0}"#).unwrap().steam_app_id,
+            2_357_570
+        );
+    }
+
+    #[test]
+    fn a_persisted_one_is_repaired() {
+        // The old UI's `1..=u32::MAX` range clamped that zero to one the first
+        // time the field was edited; it is the same "never set" state.
+        assert_eq!(
+            parse(br#"{"steam_app_id":1}"#).unwrap().steam_app_id,
             2_357_570
         );
     }
