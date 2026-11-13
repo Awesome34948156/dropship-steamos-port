@@ -2,6 +2,7 @@ pub mod app;
 pub mod catalogue;
 pub mod firewall;
 pub mod frames;
+pub mod fsutil;
 pub mod service;
 pub mod service_config;
 pub mod settings;

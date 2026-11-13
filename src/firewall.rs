@@ -9,6 +9,14 @@ use serde::{Deserialize, Serialize};
 
 pub const TABLE: &str = "dropship_steamos";
 
+/// The most networks a single plan may carry.
+///
+/// Not a resource limit — nft handles far more — but a bound on what a
+/// user-writable config file can ask this privileged helper to hand the kernel.
+/// Without it, the desktop user could point the root daemon at an arbitrarily
+/// large set on every boot.
+pub const MAX_NETWORKS: usize = 4096;
+
 /// A cgroup v2 ancestor that an nftables rule is scoped to.
 ///
 /// `nftables(8)` documents `socket cgroupv2 level NUM`, where the level counts
@@ -148,6 +156,32 @@ fn cgroup_inode(_path: &str) -> Option<u64> {
     None
 }
 
+/// Splits a selection into the two lists nft stores separately.
+pub(crate) fn split_families(networks: Vec<IpNet>) -> (Vec<IpNet>, Vec<IpNet>) {
+    networks
+        .into_iter()
+        .partition(|network| network.addr().is_ipv4())
+}
+
+/// Rejects a network that is in the wrong family list.
+///
+/// Shared by the service contract and the firewall plan, so a value that could
+/// not be a real plan is refused before it reaches nft regardless of which path
+/// (service.json or the helper's stdin) carried it.
+pub(crate) fn validate_families(ipv4: &[IpNet], ipv6: &[IpNet]) -> Result<()> {
+    for network in ipv4 {
+        if !network.addr().is_ipv4() {
+            bail!("ipv4 list contains a non-IPv4 network: {network}");
+        }
+    }
+    for network in ipv6 {
+        if !network.addr().is_ipv6() {
+            bail!("ipv6 list contains a non-IPv6 network: {network}");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RulePlan {
     /// Mandatory: a plan without a cgroup would block the whole device, so it
@@ -160,9 +194,7 @@ pub struct RulePlan {
 
 impl RulePlan {
     pub fn from_networks(networks: Vec<IpNet>, cgroup: CgroupMatch) -> Self {
-        let (ipv4, ipv6) = networks
-            .into_iter()
-            .partition(|network| network.addr().is_ipv4());
+        let (ipv4, ipv6) = split_families(networks);
         Self { cgroup, ipv4, ipv6 }
     }
 
@@ -171,24 +203,21 @@ impl RulePlan {
     }
 
     pub fn nft_script(&self) -> String {
+        let families = [
+            ("blocked_ipv4", "ipv4_addr", "ip", &self.ipv4),
+            ("blocked_ipv6", "ipv6_addr", "ip6", &self.ipv6),
+        ];
+
         let mut script = format!("table inet {TABLE} {{\n");
-        if !self.ipv4.is_empty() {
-            script.push_str("  set blocked_ipv4 { type ipv4_addr; flags interval; elements = { ");
+        for (set, address_type, _, networks) in families.iter() {
+            if networks.is_empty() {
+                continue;
+            }
+            script.push_str(&format!(
+                "  set {set} {{ type {address_type}; flags interval; elements = {{ "
+            ));
             script.push_str(
-                &self
-                    .ipv4
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-            script.push_str(" } }\n");
-        }
-        if !self.ipv6.is_empty() {
-            script.push_str("  set blocked_ipv6 { type ipv6_addr; flags interval; elements = { ");
-            script.push_str(
-                &self
-                    .ipv6
+                &networks
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
@@ -198,15 +227,12 @@ impl RulePlan {
         }
         script
             .push_str("  chain output { type filter hook output priority filter; policy accept;\n");
-        if !self.ipv4.is_empty() {
+        for (set, _, keyword, networks) in families.iter() {
+            if networks.is_empty() {
+                continue;
+            }
             script.push_str(&format!(
-                "    {} ip daddr @blocked_ipv4 drop\n",
-                self.cgroup.nft_expr()
-            ));
-        }
-        if !self.ipv6.is_empty() {
-            script.push_str(&format!(
-                "    {} ip6 daddr @blocked_ipv6 drop\n",
+                "    {} {keyword} daddr @{set} drop\n",
                 self.cgroup.nft_expr()
             ));
         }
@@ -219,11 +245,24 @@ impl RulePlan {
         if self.is_empty() {
             bail!("refusing to install an empty firewall plan; use disable instead");
         }
-        Ok(())
+
+        let total = self.ipv4.len() + self.ipv6.len();
+        if total > MAX_NETWORKS {
+            bail!("firewall plan lists {total} networks, more than the {MAX_NETWORKS} allowed");
+        }
+
+        // The families are stored apart, so a v6 address in the v4 list is a
+        // sign the plan was hand-edited or written by something that is not us.
+        // nft would reject the resulting set anyway; failing here says why.
+        validate_families(&self.ipv4, &self.ipv6)
     }
 }
 
-pub fn apply(plan: &RulePlan) -> Result<()> {
+/// Applies `plan`, returning the identity of the cgroup nft bound it to.
+///
+/// The inode is read immediately after nft succeeds, here, so both callers
+/// record the same object and neither can lose the ordering rule.
+pub fn apply(plan: &RulePlan) -> Result<ScopedCgroup> {
     plan.validate()?;
     // Best effort, and deliberately silent. On a first apply the table is
     // simply not there, and nft says so on stderr; inheriting that would put an
@@ -255,7 +294,7 @@ pub fn apply(plan: &RulePlan) -> Result<()> {
         // rather than falling back to anything broader.
         bail!("nft rejected the Dropship rules: {stderr}");
     }
-    Ok(())
+    Ok(ScopedCgroup::of(&plan.cgroup))
 }
 
 /// Whether `nft list tables` output names the Dropship table.
@@ -359,6 +398,43 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn an_oversized_rule_plan_is_rejected() {
+        let plan = RulePlan {
+            cgroup: example_cgroup(),
+            ipv4: vec!["192.0.2.0/24".parse().unwrap(); MAX_NETWORKS + 1],
+            ipv6: vec![],
+        };
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn a_rule_plan_at_the_limit_is_accepted() {
+        let plan = RulePlan {
+            cgroup: example_cgroup(),
+            ipv4: vec!["192.0.2.0/24".parse().unwrap(); MAX_NETWORKS],
+            ipv6: vec![],
+        };
+        assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn a_network_in_the_wrong_family_list_is_rejected() {
+        let plan = RulePlan {
+            cgroup: example_cgroup(),
+            ipv4: vec!["2001:db8::/32".parse().unwrap()],
+            ipv6: vec![],
+        };
+        assert!(plan.validate().is_err());
+
+        let plan = RulePlan {
+            cgroup: example_cgroup(),
+            ipv4: vec![],
+            ipv6: vec!["192.0.2.0/24".parse().unwrap()],
+        };
+        assert!(plan.validate().is_err());
     }
 
     #[test]

@@ -56,6 +56,14 @@ pub struct DropshipApp {
     service_state: Option<service::PublishedState>,
     catalogue: Option<Catalogue>,
     catalogue_rx: Option<Receiver<Result<Catalogue, String>>>,
+    /// The networks the catalogue currently resolves the selection to.
+    ///
+    /// Cached rather than recomputed per frame: it is read by the status line,
+    /// the stale-rules check and the manual plan, and only changes when the
+    /// catalogue arrives or a box is ticked. The `Err` is the message shown
+    /// while there is no catalogue — "not loaded yet" is not "nothing
+    /// selected", and the two must not look alike.
+    resolved: Result<Vec<IpNet>, String>,
     /// Where Steam lives — the filesystem half of [`steam::SteamInstall`].
     ///
     /// Refreshed on demand rather than on a timer: finding it stats the Steam
@@ -64,12 +72,24 @@ pub struct DropshipApp {
     steam: steam::SteamInstall,
     /// The live half, fed by the game prober.
     game_rx: Receiver<(Option<u32>, Option<CgroupMatch>)>,
-    /// A Steam-library scan that was asked for and has not answered yet.
+    /// The identity of the live cgroup, read once per prober message.
+    ///
+    /// The stale-rules check runs on every frame, and deriving this there would
+    /// `stat` the cgroup sixty times a second. Reading it once per observation
+    /// still catches a cgroup recreated at an unchanged path, which is what a
+    /// Steam restart does.
+    live_scoped: Option<ScopedCgroup>,
+    /// A Steam-library scan that was asked for and has not answered yet, with
+    /// the app id it was started for.
+    ///
+    /// The id travels with the receiver so a scan started before an app-id
+    /// change cannot write its answer over the new id's, and so a scan for an
+    /// old id can be replaced instead of waited on.
     ///
     /// Doubles as the reason the hint reads "looking" rather than "not found":
     /// an empty root means "no answer yet", not "no Steam".
-    install_rx: Option<Receiver<steam::SteamInstall>>,
-    service_rx: Receiver<(bool, Option<service::PublishedState>)>,
+    install_rx: Option<(u32, Receiver<steam::SteamInstall>)>,
+    service_rx: Receiver<(Option<bool>, Option<service::PublishedState>)>,
     /// A privileged helper run that was asked for and has not finished.
     ///
     /// Its presence is also what disables the manual buttons: a second `pkexec`
@@ -77,13 +97,14 @@ pub struct DropshipApp {
     helper_rx: Option<Receiver<HelperOutcome>>,
     status: String,
     show_rule_preview: bool,
-    /// The cgroup the currently loaded rules were scoped to, so a relaunch of
-    /// the game — or a restart of Steam, which rebuilds the game's cgroup at an
-    /// unchanged path — can be detected and the user told to re-apply.
+    /// The rules the manual path currently has installed, with the selection
+    /// they were built from, so a relaunch of the game, a restart of Steam —
+    /// which rebuilds the game's cgroup at an unchanged path — or a change of
+    /// selected regions can be detected and the user told to re-apply.
     ///
     /// Only meaningful in the manual path. Once the service is running it knows
     /// this itself and publishes it.
-    last_applied: Option<ScopedCgroup>,
+    last_applied: Option<AppliedManual>,
     /// Leaves the process if this window ever stops being drawn, which is the
     /// one way its event loop can stop answering the desktop. See
     /// [`crate::frames`].
@@ -95,9 +116,21 @@ struct HelperOutcome {
     /// `"apply"` or `"disable"`, echoed so the window knows which state to move
     /// to without keeping a second copy of what it asked for.
     action: &'static str,
-    /// The scope the rules were bound to, read once the helper had finished.
-    applied: Option<ScopedCgroup>,
+    /// The rules the helper left installed, read once it had finished.
+    applied: Option<AppliedManual>,
     result: Result<(), String>,
+}
+
+/// The manual apply that is currently installed: its scope and the selection
+/// it was built from.
+///
+/// The selection matters because the cgroup staying put does not mean the
+/// user's choice did. Without it, ticking a new region after Apply would leave
+/// the old rules in place with no hint that they are stale.
+#[derive(Clone, Debug)]
+struct AppliedManual {
+    scope: ScopedCgroup,
+    networks: BTreeSet<IpNet>,
 }
 
 impl DropshipApp {
@@ -124,7 +157,9 @@ impl DropshipApp {
             service_state: None,
             catalogue: None,
             catalogue_rx: None,
+            resolved: Err("The catalogue is not loaded yet".to_owned()),
             steam: steam::SteamInstall::default(),
+            live_scoped: None,
             install_rx: None,
             helper_rx: None,
             status: "Loading the current server catalogue…".to_owned(),
@@ -143,29 +178,29 @@ impl DropshipApp {
         if self.catalogue_rx.is_some() {
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(catalogue::fetch().map_err(|error| error.to_string()));
-            ctx.request_repaint();
+        let rx = spawn_oneshot(self.ctx.clone(), move || {
+            catalogue::fetch().map_err(|error| error.to_string())
         });
         self.catalogue_rx = Some(rx);
         self.status = "Refreshing the server catalogue…".to_owned();
     }
 
-    /// Starts a scan for where Steam lives, unless one is already running.
+    /// Starts a scan for where Steam lives unless one for this app id is
+    /// already running.
+    ///
+    /// A scan left over from a previous app id is replaced rather than waited
+    /// on: its answer would describe a different app, and the window would
+    /// report the wrong "installed" hint. Dropping the old receiver makes its
+    /// thread's send fail, which is how that thread learns to exit.
     fn refresh_install(&mut self) {
-        if self.install_rx.is_some() {
+        let app_id = self.settings.steam_app_id;
+        if let Some((running, _)) = &self.install_rx
+            && *running == app_id
+        {
             return;
         }
-        let app_id = self.settings.steam_app_id;
-        let (tx, rx) = mpsc::channel();
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(steam::discover(app_id));
-            ctx.request_repaint();
-        });
-        self.install_rx = Some(rx);
+        let rx = spawn_oneshot(self.ctx.clone(), move || steam::discover(app_id));
+        self.install_rx = Some((app_id, rx));
     }
 
     fn poll_catalogue(&mut self) {
@@ -179,8 +214,9 @@ impl DropshipApp {
                 self.catalogue_rx = None;
                 // A rotated catalogue can change what a token resolves to, so
                 // the contract is rewritten here and not only when the user
-                // ticks a box. Skipping this would mean the first rotation
-                // after an update never reached the service.
+                // ticks a box. The cache is refreshed first because the
+                // contract must be built from the new answer.
+                self.refresh_resolved();
                 self.sync_service_config();
             }
             Ok(Err(error)) => {
@@ -204,25 +240,38 @@ impl DropshipApp {
     /// shows the newest answer instead of working through a backlog.
     fn poll_game(&mut self) {
         while let Ok((game_pid, cgroup)) = self.game_rx.try_recv() {
+            // Read the cgroup's identity once per observation, here, rather
+            // than in the per-frame stale check: this is a `stat`, and the
+            // prober speaks every couple of seconds while the window paints
+            // far more often. Doing it on each message is also what notices a
+            // cgroup recreated at an unchanged path — the inode is the signal,
+            // and the path comparison alone cannot see the change.
+            self.live_scoped = cgroup.as_ref().map(ScopedCgroup::of);
             self.steam.game_pid = game_pid;
             self.steam.cgroup = cgroup;
         }
     }
 
     fn poll_install(&mut self) {
-        let Some(rx) = self.install_rx.take() else {
+        let Some((app_id, rx)) = self.install_rx.take() else {
             return;
         };
         match rx.try_recv() {
             Ok(install) => {
-                // Only the filesystem half is taken. The live half belongs to
-                // the prober, which refreshes it every couple of seconds and is
-                // therefore always at least as fresh as this scan.
-                self.steam.root = install.root;
-                self.steam.proton_prefix = install.proton_prefix;
-                self.steam.installed = install.installed;
+                if app_id == self.settings.steam_app_id {
+                    // Only the filesystem half is taken. The live half belongs
+                    // to the prober, which refreshes it every couple of seconds
+                    // and is therefore always at least as fresh as this scan.
+                    self.steam.root = install.root;
+                    self.steam.proton_prefix = install.proton_prefix;
+                    self.steam.installed = install.installed;
+                } else {
+                    // The app id changed while this scan was in flight, so its
+                    // answer is about another app. Drop it and look again.
+                    self.refresh_install();
+                }
             }
-            Err(mpsc::TryRecvError::Empty) => self.install_rx = Some(rx),
+            Err(mpsc::TryRecvError::Empty) => self.install_rx = Some((app_id, rx)),
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.status = "Could not look for Steam.".to_owned();
             }
@@ -231,8 +280,15 @@ impl DropshipApp {
 
     fn poll_service(&mut self) {
         while let Ok((active, state)) = self.service_rx.try_recv() {
-            self.service_active = Some(active);
-            self.service_state = state;
+            // Only a settled answer is evidence. `activating`, `deactivating`,
+            // `reloading` and a failed D-Bus round-trip all arrive as `None`,
+            // and treating any of them as "not running" would hand the window
+            // the manual path mid-restart — whose unlocked Disable can delete
+            // the table the restarted watcher is about to re-create.
+            if let Some(active) = active {
+                self.service_active = Some(active);
+                self.service_state = state;
+            }
         }
     }
 
@@ -262,32 +318,64 @@ impl DropshipApp {
         }
     }
 
+    /// The line under the toolbar buttons: what is happening right now.
+    ///
+    /// The administrator wait is derived rather than stored, so a catalogue or
+    /// poll completion that lands while `pkexec` is up cannot overwrite it.
+    /// That message is the only warning that the window is about to stop
+    /// taking input behind a password prompt; losing it reads as a hang.
+    fn status_text(&self) -> &str {
+        if self.helper_rx.is_some() {
+            "Waiting for administrator authorization…"
+        } else {
+            &self.status
+        }
+    }
+
     fn save_settings(&mut self) {
         if let Err(error) = settings::save(&self.settings) {
             self.status = format!("Could not save settings: {error}");
         }
     }
 
-    /// The selected networks, which needs the catalogue but not the game.
+    /// Recomputes the cached selection from the catalogue and the ticked
+    /// tokens.
+    ///
+    /// Called on the two paths that can change the answer — the catalogue
+    /// landing, and a box being ticked — rather than from the frame loop, which
+    /// would re-walk the whole catalogue sixty times a second.
+    fn refresh_resolved(&mut self) {
+        self.resolved = match &self.catalogue {
+            Some(catalogue) => Ok(catalogue::selected_networks(
+                catalogue,
+                &self.settings.blocked_server_tokens,
+            )),
+            None => Err("The catalogue is not loaded yet".to_owned()),
+        };
+    }
+
+    /// The cached selection: needs the catalogue but not the game.
     ///
     /// Split out from [`Self::plan`] because the service contract is written
     /// whether or not Overwatch is running — that is the whole point of being
     /// able to configure in advance.
-    fn resolved_networks(&self) -> Result<Vec<IpNet>, String> {
-        let catalogue = self
-            .catalogue
-            .as_ref()
-            .ok_or("The catalogue is not loaded yet")?;
-        catalogue::selected_networks(catalogue, &self.settings.blocked_server_tokens)
-            .map_err(|error| error.to_string())
+    fn resolved_networks(&self) -> Result<&[IpNet], &str> {
+        self.resolved.as_deref().map_err(|error| error.as_str())
     }
 
     /// A plan for the manual `pkexec` path, which needs a live cgroup.
+    ///
+    /// Only the manual path builds one. Once the service is running it owns
+    /// the rules, and a plan built here would put "Start Overwatch first…" on
+    /// screen over a deck that is blocking fine.
     fn plan(&self) -> Result<RulePlan, String> {
         let cgroup = self.steam.cgroup.clone().ok_or(
             "Start Overwatch first: blocks are scoped to its process tree, which only exists while it runs.",
         )?;
-        Ok(RulePlan::from_networks(self.resolved_networks()?, cgroup))
+        Ok(RulePlan::from_networks(
+            self.resolved_networks()?.to_vec(),
+            cgroup,
+        ))
     }
 
     /// Rewrites the contract if the selection actually changed.
@@ -296,8 +384,17 @@ impl DropshipApp {
     /// refreshed catalogue, a different app id. The comparison keeps the
     /// revision meaningful: it counts real changes, not window opens.
     fn sync_service_config(&mut self) {
-        let Ok(networks) = self.resolved_networks() else {
-            return;
+        let networks = match self.resolved_networks() {
+            Ok(networks) => networks.to_vec(),
+            Err(error) => {
+                // Before the catalogue arrives there is no decision to report.
+                // Once it has, a failure means the selection never reached the
+                // service, which the user must not mistake for "saved".
+                if self.catalogue.is_some() {
+                    self.status = format!("Could not prepare the blocking settings: {error}");
+                }
+                return;
+            }
         };
         let current: BTreeSet<IpNet> = self.service.networks().into_iter().collect();
         let next: BTreeSet<IpNet> = networks.iter().copied().collect();
@@ -345,32 +442,35 @@ impl DropshipApp {
             },
             None => None,
         };
-        let scope = plan
-            .filter(|_| action == "apply")
-            .map(|plan| plan.cgroup.clone());
+        let applied_plan = plan.filter(|_| action == "apply").map(|plan| {
+            (
+                plan.cgroup.clone(),
+                plan.ipv4.iter().chain(&plan.ipv6).copied().collect(),
+            )
+        });
 
-        let (tx, rx) = mpsc::channel();
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
+        let rx = spawn_oneshot(self.ctx.clone(), move || {
             let result = run_privileged_helper(&helper, action, payload);
             // Read the scope *after* the rules are up, so what gets recorded is
-            // the cgroup object nft has just bound them to — the same ordering
-            // the service uses before it publishes. Reading it earlier would
-            // leave a window in which the cgroup could be replaced between the
-            // reading and the binding.
+            // the cgroup object nft has just bound them to. This side has to
+            // read it for itself: `pkexec` returns only the helper's exit
+            // status, not the identity the helper's own apply recorded.
             let applied = match &result {
-                Ok(()) if action == "apply" => scope.as_ref().map(ScopedCgroup::of),
-                _ => None,
+                Ok(()) => applied_plan.map(|(cgroup, networks)| AppliedManual {
+                    scope: ScopedCgroup::of(&cgroup),
+                    networks,
+                }),
+                Err(_) => None,
             };
-            let _ = tx.send(HelperOutcome {
+            HelperOutcome {
                 action,
                 applied,
                 result,
-            });
-            ctx.request_repaint();
+            }
         });
         self.helper_rx = Some(rx);
-        self.status = "Waiting for administrator authorization…".to_owned();
+        // The wait message is derived by [`Self::status_text`] from
+        // `helper_rx`, so it cannot be overwritten by a poll landing mid-run.
     }
 }
 
@@ -410,7 +510,7 @@ impl eframe::App for DropshipApp {
                 if ui.button("Refresh Steam status").clicked() {
                     self.refresh_install();
                 }
-                ui.label(&self.status);
+                ui.label(self.status_text());
             });
 
             ui.separator();
@@ -458,25 +558,36 @@ impl eframe::App for DropshipApp {
                 }
             }
 
-            // Only warn while the game is actually running in a different
-            // scope. A game that has simply exited is not a stale rule yet.
-            // "Different" means the cgroup object, not just its path — a Steam
-            // restart rebuilds app-steam@autostart.service at an identical
-            // path, and rules bound to the old one then match nothing.
+            // Only warn while the manual path owns the rules. The running
+            // service re-scopes and re-applies itself without being asked.
             //
-            // Only relevant to the manual path; the running service re-scopes
-            // itself without being asked.
-            let stale = self.service_active != Some(true)
+            // Two kinds of staleness:
+            // - the cgroup object changed, which a Steam restart does at an
+            //   unchanged path, so the rules match nothing;
+            // - the selection changed, so the rules still match but block the
+            //   wrong regions.
+            let manual = self.service_active != Some(true);
+            let scope_replaced = manual
                 && self.last_applied.as_ref().is_some_and(|applied| {
-                    self.steam
-                        .cgroup
+                    self.live_scoped
                         .as_ref()
-                        .is_some_and(|live| !applied.still_matches(&ScopedCgroup::of(live)))
+                        .is_some_and(|live| !applied.scope.still_matches(live))
                 });
-            if stale {
+            let selection_changed = manual
+                && self.last_applied.as_ref().is_some_and(|applied| {
+                    self.resolved_networks().ok().is_some_and(|networks| {
+                        applied.networks != networks.iter().copied().collect()
+                    })
+                });
+            if scope_replaced {
                 ui.colored_label(
                     egui::Color32::YELLOW,
                     "Overwatch's process tree was replaced, so the existing blocks no longer match it. Click Apply blocks again to re-scope them.",
+                );
+            } else if selection_changed {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "The region selection changed since blocks were applied. Click Apply blocks again to update them.",
                 );
             }
 
@@ -502,23 +613,35 @@ impl eframe::App for DropshipApp {
             }
             if selection_changed {
                 self.save_settings();
+                // The cache is an input to the contract, so it is refreshed
+                // before the contract is rewritten.
+                self.refresh_resolved();
                 self.sync_service_config();
             }
 
-            let plan = self.plan();
-            match &plan {
-                Ok(plan) => {
-                    ui.label(format!("Selected ranges: {} IPv4, {} IPv6", plan.ipv4.len(), plan.ipv6.len()));
+            // The counts come from the cached selection, so they are right
+            // whether or not Overwatch is running; only the plan itself needs
+            // a live cgroup.
+            match self.resolved_networks() {
+                Ok(networks) => {
+                    let ipv4 = networks
+                        .iter()
+                        .filter(|network| network.addr().is_ipv4())
+                        .count();
+                    ui.label(format!(
+                        "Selected ranges: {ipv4} IPv4, {} IPv6",
+                        networks.len() - ipv4
+                    ));
                 }
                 Err(reason) => {
-                    ui.colored_label(egui::Color32::GRAY, reason.as_str());
+                    ui.colored_label(egui::Color32::GRAY, reason);
                 }
             }
 
             ui.separator();
             match self.service_active {
                 Some(true) => self.service_controls(ui),
-                Some(false) => self.manual_controls(ui, &plan),
+                Some(false) => self.manual_controls(ui),
                 None => {
                     // Showing the manual controls here would tell the user
                     // automatic blocking is not installed, which is a guess
@@ -528,15 +651,6 @@ impl eframe::App for DropshipApp {
                         ui.label("Checking whether automatic blocking is installed…");
                     });
                 }
-            }
-
-            if self.show_rule_preview {
-                ui.separator();
-                ui.label("Rules that will be sent to the privileged helper:");
-                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                    let script = plan.map(|plan| plan.nft_script()).unwrap_or_else(|error| error);
-                    ui.code(script);
-                });
             }
         });
     }
@@ -567,15 +681,21 @@ impl DropshipApp {
         }
 
         match &self.service_state {
-            Some(state) => match &state.applied {
-                Some(scoped) => {
+            Some(state) => match (&state.applied, state.table_present) {
+                (Some(scoped), _) => {
                     ui.colored_label(
                         egui::Color32::LIGHT_GREEN,
                         "Blocks are installed, scoped to Overwatch's process tree.",
                     );
                     ui.label(format!("Scope: {}", scoped.cgroup.path));
                 }
-                None => {
+                (None, true) => {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "A Dropship firewall table is installed, but the service has not identified its scope. It will be removed shortly.",
+                    );
+                }
+                (None, false) => {
                     ui.colored_label(
                         egui::Color32::GRAY,
                         "No blocks installed right now. Start Overwatch and they will be applied.",
@@ -599,7 +719,19 @@ impl DropshipApp {
     }
 
     /// The UI when there is no service, which is the original manual flow.
-    fn manual_controls(&mut self, ui: &mut egui::Ui, plan: &Result<RulePlan, String>) {
+    fn manual_controls(&mut self, ui: &mut egui::Ui) {
+        // Only this path builds a plan. With the service running, the rules
+        // are the service's to manage, and "Start Overwatch first…" over a
+        // deck that is blocking fine would be a lie.
+        let plan = self.plan();
+        // The range counts above already report a missing catalogue, so only a
+        // plan that failed for a different reason is shown here.
+        if let Err(reason) = &plan
+            && self.resolved.is_ok()
+        {
+            ui.colored_label(egui::Color32::GRAY, reason.as_str());
+        }
+
         ui.colored_label(
             egui::Color32::GRAY,
             "Automatic blocking is not installed, so blocks are applied by hand and last until you remove them.",
@@ -628,7 +760,7 @@ impl DropshipApp {
             if ui
                 .add_enabled(can_apply && !busy, egui::Button::new("Apply blocks"))
                 .clicked()
-                && let Ok(plan) = plan
+                && let Ok(plan) = &plan
             {
                 self.run_helper("apply", Some(plan));
             }
@@ -639,7 +771,55 @@ impl DropshipApp {
                 self.run_helper("disable", None);
             }
         });
+
+        // The script is built only while the preview is open, and only on this
+        // path: it is a projection of the plan, not state the window keeps.
+        if self.show_rule_preview {
+            ui.separator();
+            ui.label("Rules that will be sent to the privileged helper:");
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .show(ui, |ui| match &plan {
+                    Ok(plan) => ui.code(plan.nft_script()),
+                    Err(error) => ui.code(error.as_str()),
+                });
+        }
     }
+}
+
+/// Runs `work` on a thread of its own, waking the window when it is done.
+///
+/// The receiver is the thread's lifetime: dropping it makes the send fail,
+/// which is how the thread learns to exit.
+fn spawn_oneshot<T: Send + 'static>(
+    ctx: egui::Context,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+        ctx.request_repaint();
+    });
+    rx
+}
+
+/// Runs `work` every `interval`, sending each result and waking the window.
+fn spawn_periodic<T: Send + 'static>(
+    ctx: egui::Context,
+    interval: Duration,
+    mut work: impl FnMut() -> T + Send + 'static,
+) -> Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            if tx.send(work()).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+            std::thread::sleep(interval);
+        }
+    });
+    rx
 }
 
 /// Watches for the game on a thread of its own.
@@ -651,17 +831,7 @@ impl DropshipApp {
 ///
 /// Exits when the window drops the receiver, so it never outlives the app.
 fn spawn_game_prober(ctx: egui::Context) -> Receiver<(Option<u32>, Option<CgroupMatch>)> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        loop {
-            if tx.send(steam::game_state()).is_err() {
-                return;
-            }
-            ctx.request_repaint();
-            std::thread::sleep(STEAM_POLL_INTERVAL);
-        }
-    });
-    rx
+    spawn_periodic(ctx, STEAM_POLL_INTERVAL, steam::game_state)
 }
 
 /// Asks systemd about the watcher service on a thread of its own.
@@ -669,24 +839,22 @@ fn spawn_game_prober(ctx: egui::Context) -> Receiver<(Option<u32>, Option<Cgroup
 /// `systemctl` is a D-Bus round-trip, which takes as long as systemd takes to
 /// answer — and the longest it ever takes is while the machine is shutting down,
 /// which is precisely when the window must not be waiting on it.
-fn spawn_service_prober(ctx: egui::Context) -> Receiver<(bool, Option<service::PublishedState>)> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        loop {
-            let active = service::is_active();
-            let state = if active {
-                service::read_state().ok()
-            } else {
-                None
-            };
-            if tx.send((active, state)).is_err() {
-                return;
-            }
-            ctx.request_repaint();
-            std::thread::sleep(SERVICE_POLL_INTERVAL);
-        }
-    });
-    rx
+///
+/// The first half of each message is tri-state: `None` means systemd did not
+/// settle on an answer, not that the service stopped. The published state is
+/// read only when the service is known to be running, so a stale `state.json`
+/// from before a restart can never be sent alongside "cannot tell".
+fn spawn_service_prober(
+    ctx: egui::Context,
+) -> Receiver<(Option<bool>, Option<service::PublishedState>)> {
+    spawn_periodic(ctx, SERVICE_POLL_INTERVAL, || {
+        let active = service::is_active();
+        let state = match active {
+            Some(true) => service::read_state().ok(),
+            _ => None,
+        };
+        (active, state)
+    })
 }
 
 /// Runs the privileged helper through `pkexec`, on a thread the caller owns.

@@ -11,6 +11,14 @@ use std::{io::Read, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use dropship_steamos::{firewall, service};
 
+/// The most bytes of plan the helper will read from stdin.
+///
+/// `pkexec` hands us whatever the unprivileged caller wrote, so the read has to
+/// be bounded before any parsing happens. Four times the largest service config,
+/// and already far past [`firewall::MAX_NETWORKS`], so a plan this big is never
+/// a real one.
+const MAX_PLAN_BYTES: u64 = 4 * 1024 * 1024;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let action = args
@@ -24,11 +32,8 @@ fn main() -> Result<()> {
             // anyway. Failing loudly here is better than a flap.
             let _lock = service::Lock::acquire()?;
 
-            let mut input = String::new();
-            std::io::stdin().read_to_string(&mut input)?;
-            let plan: firewall::RulePlan =
-                serde_json::from_str(&input).context("invalid firewall plan")?;
-            firewall::apply(&plan)
+            let plan = read_plan(std::io::stdin())?;
+            firewall::apply(&plan).map(|_| ())
         }
 
         // Deliberately *not* locked. This is the safe direction — it only ever
@@ -41,6 +46,24 @@ fn main() -> Result<()> {
 
         _ => bail!("usage: dropship-steamos-helper <apply|disable|watch --config PATH>"),
     }
+}
+
+/// Reads and deserialises a firewall plan from `reader`.
+///
+/// The cap is applied while reading rather than by trusting a length the caller
+/// supplied, so a stream that never ends cannot grow this process without
+/// bound. One byte past the cap is read deliberately: that is what distinguishes
+/// "exactly at the limit" from "there was more".
+fn read_plan(reader: impl Read) -> Result<firewall::RulePlan> {
+    let mut input = String::new();
+    let mut limited = reader.take(MAX_PLAN_BYTES + 1);
+    limited
+        .read_to_string(&mut input)
+        .context("could not read firewall plan from stdin")?;
+    if input.len() as u64 > MAX_PLAN_BYTES {
+        bail!("firewall plan is larger than the {MAX_PLAN_BYTES} bytes allowed");
+    }
+    serde_json::from_str(&input).context("invalid firewall plan")
 }
 
 /// Reads the path after `--config`.
@@ -91,5 +114,34 @@ mod tests {
         assert!(config_path(args(&["--config"])).is_err());
         assert!(config_path(args(&["service.json"])).is_err());
         assert!(config_path(args(&["--path", "/etc/x"])).is_err());
+    }
+
+    #[test]
+    fn a_valid_plan_is_read_from_the_stream() {
+        let input = r#"{
+            "cgroup": {"path": "user.slice/app.slice/app-steam-1.scope", "level": 3},
+            "ipv4": ["192.0.2.0/24"],
+            "ipv6": ["2001:db8::/32"]
+        }"#;
+
+        let plan = read_plan(std::io::Cursor::new(input.as_bytes())).unwrap();
+        assert_eq!(plan.cgroup.path, "user.slice/app.slice/app-steam-1.scope");
+        assert_eq!(plan.ipv4.len(), 1);
+        assert_eq!(plan.ipv6.len(), 1);
+    }
+
+    #[test]
+    fn malformed_json_is_refused() {
+        assert!(read_plan(std::io::Cursor::new(b"{not json".as_slice())).is_err());
+        // Valid JSON, but not a plan: the cgroup is mandatory.
+        assert!(read_plan(std::io::Cursor::new(b"{}".as_slice())).is_err());
+    }
+
+    #[test]
+    fn an_oversized_plan_is_refused_before_parsing() {
+        let oversized = vec![b' '; MAX_PLAN_BYTES as usize + 1];
+        let error = read_plan(std::io::Cursor::new(oversized)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("larger than"), "{message}");
     }
 }

@@ -18,6 +18,7 @@
 
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -25,19 +26,16 @@ use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::fsutil;
+
+pub use crate::firewall::MAX_NETWORKS;
+
 /// The only schema version this build understands.
 ///
 /// A file claiming any other version is refused rather than guessed at: a newer
 /// GUI may mean something different by a field, and acting on a half-understood
 /// file is how a root daemon blocks the wrong thing.
 pub const VERSION: u32 = 1;
-
-/// The most CIDRs the watcher will act on.
-///
-/// Not a resource limit — nft handles far more — but a bound on what a
-/// user-writable file can ask a root process to hand the kernel. Without it,
-/// `deck` could point the daemon at an arbitrarily large set on every boot.
-pub const MAX_NETWORKS: usize = 4096;
 
 /// The largest file worth reading. Comfortably above a full [`MAX_NETWORKS`]
 /// selection, so it only ever rejects something that was never a real config.
@@ -64,9 +62,7 @@ pub struct ServiceConfig {
 impl ServiceConfig {
     /// Builds a config from a selection, splitting the families for storage.
     pub fn new(enabled: bool, revision: u64, networks: Vec<IpNet>) -> Self {
-        let (ipv4, ipv6) = networks
-            .into_iter()
-            .partition(|network| network.addr().is_ipv4());
+        let (ipv4, ipv6) = crate::firewall::split_families(networks);
         Self {
             version: VERSION,
             enabled,
@@ -99,18 +95,7 @@ impl ServiceConfig {
         // The families are stored apart, so a v6 address in the v4 list is a
         // sign the file was hand-edited or written by something that is not us.
         // nft would reject the resulting set anyway; failing here says why.
-        for network in &self.ipv4 {
-            if !network.addr().is_ipv4() {
-                bail!("ipv4 list contains a non-IPv4 network: {network}");
-            }
-        }
-        for network in &self.ipv6 {
-            if !network.addr().is_ipv6() {
-                bail!("ipv6 list contains a non-IPv6 network: {network}");
-            }
-        }
-
-        Ok(())
+        crate::firewall::validate_families(&self.ipv4, &self.ipv6)
     }
 }
 
@@ -129,11 +114,7 @@ pub fn parse(bytes: &[u8]) -> Result<ServiceConfig> {
 }
 
 pub fn path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("dropship-steamos")
-        .join("service.json"))
+    Ok(fsutil::config_dir()?.join("service.json"))
 }
 
 /// Reads and validates a config file.
@@ -141,17 +122,43 @@ pub fn path() -> Result<PathBuf> {
 /// Every error here is meant to be survivable: the caller treats a failure as
 /// "no instruction", which leaves any live rules exactly as they are. A config
 /// that cannot be read must never be read as "disable".
+///
+/// The file is opened once and inspected through that same handle. A
+/// stat-then-read pair would let the desktop user swap a regular file for a
+/// symlink or a FIFO between the two calls, and this runs as root. `O_NOFOLLOW`
+/// refuses a symlink at the final component, `O_NONBLOCK` stops a FIFO from
+/// blocking the open forever, and the `is_file` check rejects every other kind
+/// of file before a single byte is read.
 pub fn load_from(path: &Path) -> Result<ServiceConfig> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("could not stat {}", path.display()))?;
-    if metadata.len() > MAX_BYTES {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("could not stat {}", path.display()))?;
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not stat {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_BYTES) as usize);
+    let mut limited = file.take(MAX_BYTES + 1);
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_BYTES {
         bail!(
-            "{} is {} bytes, larger than any real service config",
-            path.display(),
-            metadata.len()
+            "{} is larger than the {MAX_BYTES} bytes any real service config uses",
+            path.display()
         );
     }
-    let bytes = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
     parse(&bytes)
 }
 
@@ -167,12 +174,7 @@ pub fn load() -> Result<ServiceConfig> {
 /// a wrong decision. This makes even that transient case not happen.
 pub fn save_to(path: &Path, config: &ServiceConfig) -> Result<()> {
     config.validate()?;
-    let parent = path.parent().context("service config path has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(config)?)?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    fsutil::write_json_atomic(path, config)
 }
 
 pub fn save(config: &ServiceConfig) -> Result<()> {
@@ -182,6 +184,21 @@ pub fn save(config: &ServiceConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh directory under the system temp dir, unique per test.
+    fn temp_directory(label: &str) -> PathBuf {
+        let unique = format!(
+            "dropship-config-test-{}-{}-{label}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
 
     fn networks() -> Vec<IpNet> {
         vec![
@@ -301,12 +318,7 @@ mod tests {
 
     #[test]
     fn saving_and_loading_round_trips_through_a_real_file() {
-        let directory = std::env::temp_dir().join(format!(
-            "dropship-config-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        fs::create_dir_all(&directory).unwrap();
+        let directory = temp_directory("round-trip");
         let path = directory.join("service.json");
 
         save_to(&path, &sample()).unwrap();
@@ -314,8 +326,68 @@ mod tests {
         assert!(loaded.enabled);
         assert_eq!(loaded.networks(), sample().networks());
 
-        // The temporary file must not be left behind.
-        assert!(!directory.join("service.json.tmp").exists());
+        // No temporary file may be left behind.
+        let leftovers: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary file was left behind");
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_regular_config_file_loads() {
+        let directory = temp_directory("regular");
+        let path = directory.join("service.json");
+        fs::write(&path, serde_json::to_vec(&sample()).unwrap()).unwrap();
+
+        let loaded = load_from(&path).unwrap();
+        assert!(loaded.enabled);
+        assert_eq!(loaded.networks(), sample().networks());
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_valid_config_is_refused() {
+        // Root must not be redirected through a link the desktop user controls,
+        // even when the link points at a perfectly good config today.
+        let directory = temp_directory("symlink");
+        let target = directory.join("real.json");
+        save_to(&target, &sample()).unwrap();
+        let link = directory.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(load_from(&link).is_err());
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_directory_is_refused() {
+        // Opening a directory succeeds on both Linux and macOS; only the
+        // `is_file` check keeps it from being read.
+        let directory = temp_directory("directory");
+        let nested = directory.join("service.json");
+        fs::create_dir(&nested).unwrap();
+
+        assert!(load_from(&nested).is_err());
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_regular_file_is_refused() {
+        let directory = temp_directory("oversized");
+        let path = directory.join("service.json");
+        // Whitespace: large enough to trip the cap, but the size check must be
+        // what rejects it rather than the JSON parser.
+        fs::write(&path, vec![b' '; MAX_BYTES as usize + 1]).unwrap();
+
+        assert!(load_from(&path).is_err());
 
         fs::remove_dir_all(&directory).unwrap();
     }

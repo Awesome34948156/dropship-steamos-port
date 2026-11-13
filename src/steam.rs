@@ -22,46 +22,76 @@ impl SteamInstall {
     }
 }
 
-/// The whole picture, filesystem included.
+/// Where an app lives, as far as the filesystem can tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LibraryPick {
+    root: PathBuf,
+    proton_prefix: Option<PathBuf>,
+    installed: bool,
+}
+
+/// The filesystem half of the picture: where Steam and the app live.
 ///
 /// The expensive half of the pair with [`game_state`]: it stats the Steam
 /// libraries, which include the removable ones under `/run/media`. Call it when
 /// the answer could have changed — startup, a different app id, or a user
-/// asking — not on a timer.
+/// asking — not on a timer. The live fields of the returned [`SteamInstall`]
+/// are left empty; [`game_state`] is the half that reads `/proc`.
 pub fn discover(app_id: u32) -> SteamInstall {
-    let (game_pid, cgroup) = game_state();
-
-    let root = steam_roots()
-        .into_iter()
-        .find(|root| root.join("steamapps").is_dir());
-
-    let Some(root) = root else {
-        return SteamInstall {
-            game_pid,
-            cgroup,
-            ..Default::default()
-        };
+    let Some(picked) = pick_root(&steam_roots(), app_id) else {
+        return SteamInstall::default();
     };
-
-    let manifest = root.join(format!("steamapps/appmanifest_{app_id}.acf"));
-    let prefix = root.join(format!("steamapps/compatdata/{app_id}/pfx"));
     SteamInstall {
-        root,
-        proton_prefix: prefix.is_dir().then_some(prefix),
-        installed: manifest.is_file(),
-        game_pid,
-        cgroup,
+        root: picked.root,
+        proton_prefix: picked.proton_prefix,
+        installed: picked.installed,
+        ..Default::default()
     }
 }
 
+/// Picks the Steam root that holds `app_id`.
+///
+/// Every candidate root is searched for the app's manifest rather than taking
+/// the first root that merely has a `steamapps` directory: on a Deck the home
+/// library almost always exists, so that rule reports an app installed on an SD
+/// card as missing and misses its Proton prefix too. The prefix is then looked
+/// for under the root that owns the manifest.
+///
+/// When no root has the manifest, the first root with a `steamapps` directory
+/// is returned with `installed: false`, so the hint can still say where Steam
+/// was found. `None` means no root looks like a Steam library at all.
+fn pick_root(roots: &[PathBuf], app_id: u32) -> Option<LibraryPick> {
+    let pick = |root: &PathBuf, installed: bool| {
+        let prefix = root.join(format!("steamapps/compatdata/{app_id}/pfx"));
+        LibraryPick {
+            root: root.clone(),
+            proton_prefix: prefix.is_dir().then_some(prefix),
+            installed,
+        }
+    };
+
+    if let Some(root) = roots.iter().find(|root| {
+        root.join(format!("steamapps/appmanifest_{app_id}.acf"))
+            .is_file()
+    }) {
+        return Some(pick(root, true));
+    }
+
+    roots
+        .iter()
+        .find(|root| root.join("steamapps").is_dir())
+        .map(|root| pick(root, false))
+}
+
+/// Every place a Steam library may live, home and removable.
 fn steam_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
+    let mut bases = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
-        roots.push(home.join(".local/share/Steam"));
-        roots.push(home.join(".steam/steam"));
+        bases.push(home.join(".local/share/Steam"));
+        bases.push(home.join(".steam/steam"));
         // Flatpak Steam keeps its own copy of the library tree.
-        roots.push(home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"));
+        bases.push(home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"));
     }
 
     // SteamOS mounts external libraries (SD cards) under /run/media/<device>.
@@ -69,11 +99,26 @@ fn steam_roots() -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                roots.push(path);
+                bases.push(path);
             }
         }
     }
 
+    with_library_children(bases)
+}
+
+/// Adds the standard external-library layout beside each base root.
+///
+/// An external library normally sits in a `SteamLibrary` directory next to the
+/// mount point, while some layouts keep `steamapps` at the mount root itself.
+/// Both shapes are listed, base first, so the first-root fallback in
+/// [`pick_root`] keeps naming the same root the old rule did.
+fn with_library_children(bases: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(bases.len() * 2);
+    for base in bases {
+        roots.push(base.clone());
+        roots.push(base.join("SteamLibrary"));
+    }
     roots
 }
 
@@ -230,10 +275,9 @@ fn depth_within(candidates: &[GameCandidate], pid: u32) -> usize {
 
 /// Every matching process that has a readable cgroup.
 #[cfg(target_os = "linux")]
-fn game_candidates() -> Vec<GameCandidate> {
-    overwatch_pids()
-        .into_iter()
-        .filter_map(|pid| {
+fn game_candidates(pids: &[u32]) -> Vec<GameCandidate> {
+    pids.iter()
+        .filter_map(|&pid| {
             Some(GameCandidate {
                 pid,
                 parent: parent_pid(pid),
@@ -243,10 +287,16 @@ fn game_candidates() -> Vec<GameCandidate> {
         .collect()
 }
 
+/// The live game among an already-scanned set of PIDs.
+#[cfg(target_os = "linux")]
+fn live_game_from(pids: &[u32]) -> Option<(u32, CgroupMatch)> {
+    select_game_candidate(&game_candidates(pids)).map(|candidate| (candidate.pid, candidate.cgroup))
+}
+
 /// The live game: a PID and the cgroup its traffic actually runs in.
 #[cfg(target_os = "linux")]
 fn live_game() -> Option<(u32, CgroupMatch)> {
-    select_game_candidate(&game_candidates()).map(|candidate| (candidate.pid, candidate.cgroup))
+    live_game_from(&overwatch_pids())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -274,6 +324,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
 /// The comm field is parenthesised and may itself contain spaces and `)`, and
 /// the kernel does not escape it; the last `)` is the only safe split point.
 /// The fields after it are state, ppid, … in order, so ppid is the second one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parent_from_stat(stat: &str) -> Option<u32> {
     stat.rsplit_once(')')?
         .1
@@ -292,6 +343,10 @@ fn parent_from_stat(stat: &str) -> Option<u32> {
 ///
 /// [`overwatch_pids`] sorts ascending, so the first entry is the lowest PID,
 /// which is what the `ps` path returned too.
+///
+/// Kept public for tests and development tooling. [`game_state`] takes the
+/// first entry of the scan it already made, so the timed path reads `/proc`
+/// once rather than twice.
 #[cfg(target_os = "linux")]
 pub fn overwatch_pid() -> Option<u32> {
     overwatch_pids().first().copied()
@@ -315,31 +370,42 @@ pub fn overwatch_pid() -> Option<u32> {
 /// filesystems, including the removable libraries under `/run/media` — and a
 /// `stat` on a mount that is being torn down is uninterruptible, which would
 /// wedge the calling thread through a shutdown rather than merely slow it.
+#[cfg(target_os = "linux")]
 pub fn game_state() -> (Option<u32>, Option<CgroupMatch>) {
+    // One `/proc` scan feeds both the candidate selection and the PID-only
+    // fallback. Scanning again for the fallback doubled the work on a timer.
+    let pids = overwatch_pids();
     // The same selection the watcher uses, so the window's "process tree" line
     // and the manual Apply button name the cgroup the rules are actually
     // scoped to, not a launcher's.
-    match live_game() {
+    match live_game_from(&pids) {
         Some((pid, cgroup)) => (Some(pid), Some(cgroup)),
         // Still report the PID so the window can say the game is running even
         // when its cgroup could not be read.
-        None => (overwatch_pid(), None),
+        None => (pids.first().copied(), None),
     }
 }
 
-/// Picks the cgroup v2 path out of `/proc/<pid>/cgroup` contents.
+/// See the Linux version above. Without `/proc` only the PID is known.
+#[cfg(not(target_os = "linux"))]
+pub fn game_state() -> (Option<u32>, Option<CgroupMatch>) {
+    (overwatch_pid(), None)
+}
+
+/// Picks the raw cgroup v2 path out of `/proc/<pid>/cgroup` contents.
 ///
 /// The unified hierarchy is always the `0::` entry; any other lines describe
-/// legacy v1 hierarchies and are ignored.
+/// legacy v1 hierarchies and are ignored. The value is returned as the kernel
+/// wrote it, with its leading slash and any trailing `" (deleted)"` marker
+/// intact: normalising it is [`CgroupMatch::from_path`]'s job, so there is
+/// exactly one place that knows how.
 pub fn parse_cgroup_v2(contents: &str) -> Option<String> {
     contents
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
-        .map(|path| {
-            let path = path.trim();
-            path.strip_suffix(" (deleted)").unwrap_or(path).to_owned()
-        })
+        .map(str::trim)
         .filter(|path| !path.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(target_os = "linux")]
@@ -372,6 +438,8 @@ pub fn steam_library_hint(install: &SteamInstall) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     const CGROUP_FILE: &str =
@@ -403,12 +471,14 @@ mod tests {
     }
 
     #[test]
-    fn strips_the_deleted_marker() {
+    fn the_deleted_marker_is_left_for_the_cgroup_match_to_strip() {
         let zombie = "0::/user.slice/app.slice/game.scope (deleted)\n";
-        assert_eq!(
-            parse_cgroup_v2(zombie).unwrap(),
-            "/user.slice/app.slice/game.scope"
-        );
+        let raw = parse_cgroup_v2(zombie).unwrap();
+        assert_eq!(raw, "/user.slice/app.slice/game.scope (deleted)");
+        // Normalisation has a single owner; this proves the raw value still
+        // feeds it correctly.
+        let matched = CgroupMatch::from_path(&raw).unwrap();
+        assert_eq!(matched.path, "user.slice/app.slice/game.scope");
     }
 
     #[test]
@@ -416,6 +486,119 @@ mod tests {
         assert!(parse_cgroup_v2("12:pids:/user.slice\n").is_none());
         assert!(parse_cgroup_v2("").is_none());
         assert!(parse_cgroup_v2("0::\n").is_none());
+    }
+
+    /// A throwaway directory removed when the test finishes.
+    struct TempTree {
+        path: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(label: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "dropship-steam-{label}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        /// A library root under this tree, with an empty `steamapps`.
+        fn root(&self, name: &str) -> PathBuf {
+            let root = self.path.join(name);
+            std::fs::create_dir_all(root.join("steamapps")).unwrap();
+            root
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    const APP_ID: u32 = 2357570;
+
+    fn install_app(root: &Path, app_id: u32) {
+        std::fs::write(root.join(format!("steamapps/appmanifest_{app_id}.acf")), "").unwrap();
+        std::fs::create_dir_all(root.join(format!("steamapps/compatdata/{app_id}/pfx"))).unwrap();
+    }
+
+    fn prefix_under(root: &Path, app_id: u32) -> Option<PathBuf> {
+        Some(root.join(format!("steamapps/compatdata/{app_id}/pfx")))
+    }
+
+    #[test]
+    fn an_app_in_the_home_library_is_found() {
+        let tree = TempTree::new("home");
+        let home = tree.root("home/Steam");
+        let card = tree.root("card/SteamLibrary");
+        install_app(&home, APP_ID);
+
+        let picked = pick_root(&[home.clone(), card], APP_ID).unwrap();
+        assert_eq!(picked.root, home);
+        assert!(picked.installed);
+        assert_eq!(picked.proton_prefix, prefix_under(&home, APP_ID));
+    }
+
+    #[test]
+    fn an_app_that_only_lives_on_the_sd_card_is_found() {
+        // The home library exists and has its own `steamapps`; the old
+        // first-root rule stopped there and reported the app as missing.
+        let tree = TempTree::new("card");
+        let home = tree.root("home/Steam");
+        let card = tree.root("card/SteamLibrary");
+        install_app(&card, APP_ID);
+
+        let picked = pick_root(&[home, card.clone()], APP_ID).unwrap();
+        assert_eq!(picked.root, card);
+        assert!(picked.installed);
+        assert_eq!(picked.proton_prefix, prefix_under(&card, APP_ID));
+    }
+
+    #[test]
+    fn an_app_in_a_steam_library_child_is_found() {
+        // An external mount can hold the library directly or in the standard
+        // `SteamLibrary` directory beside it; this app lives in the child.
+        let tree = TempTree::new("child");
+        let home = tree.root("home/Steam");
+        let mount = tree.root("card");
+        let library = tree.root("card/SteamLibrary");
+        install_app(&library, APP_ID);
+
+        let picked = pick_root(&[home, mount, library.clone()], APP_ID).unwrap();
+        assert_eq!(picked.root, library);
+        assert!(picked.installed);
+        assert_eq!(picked.proton_prefix, prefix_under(&library, APP_ID));
+    }
+
+    #[test]
+    fn a_missing_app_falls_back_to_the_first_steam_root() {
+        let tree = TempTree::new("missing");
+        let home = tree.root("home/Steam");
+        let card = tree.root("card/SteamLibrary");
+
+        let picked = pick_root(&[home.clone(), card], APP_ID).unwrap();
+        assert_eq!(picked.root, home);
+        assert!(!picked.installed);
+        assert_eq!(picked.proton_prefix, None);
+
+        assert!(pick_root(&[], APP_ID).is_none());
+    }
+
+    #[test]
+    fn each_base_root_also_offers_its_steam_library_child() {
+        // On a Deck the SD card mounts at /run/media/<device> and its library
+        // usually sits in the standard `SteamLibrary` directory beneath it.
+        let mount = PathBuf::from("/run/media/deck/CARD");
+        assert_eq!(
+            with_library_children(vec![mount.clone()]),
+            vec![mount.clone(), mount.join("SteamLibrary")]
+        );
     }
 
     #[test]

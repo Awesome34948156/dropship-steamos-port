@@ -11,6 +11,7 @@
 //! the journal.
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     path::Path,
     thread::sleep,
@@ -18,25 +19,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     firewall::{self, ScopedCgroup},
-    service_config, steam,
-    watcher::{Decision, Observation, Watcher},
+    fsutil, service_config, steam,
+    watcher::{ConfigFacts, Decision, Observation, Watcher},
 };
-
-/// How often to look while something could be about to change: the game is
-/// running, or our rules are up and could need taking down.
-const ACTIVE_INTERVAL: Duration = Duration::from_secs(2);
-
-/// How often to look when nothing is happening at all.
-///
-/// The only thing being waited for is a game launch, and a match takes far
-/// longer than this to load, so the poll can be lazy. This matters on a
-/// handheld: it is the difference between waking the CPU every two seconds
-/// forever and doing so every ten.
-const IDLE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How often to confirm the table is still there even when settled.
 ///
@@ -65,6 +55,13 @@ pub const UNIT: &str = "dropship-steamos.service";
 pub struct PublishedState {
     /// The scope the installed rules are bound to, or `None` if none are.
     pub applied: Option<ScopedCgroup>,
+    /// Whether `inet dropship_steamos` exists right now.
+    ///
+    /// `applied == None` alone cannot distinguish "nothing is installed" from
+    /// "a table is installed but this watcher has not identified its scope".
+    /// The GUI needs both facts to report the truth.
+    #[serde(default)]
+    pub table_present: bool,
     /// The config revision those rules were built from, for diagnostics.
     pub revision: u64,
     /// The last thing the watcher did: `apply`, `disable`, or `starting`.
@@ -72,18 +69,51 @@ pub struct PublishedState {
     pub since_unix_secs: u64,
 }
 
-/// Whether the watcher service is running.
+/// Whether the watcher service is running, when that question has an answer.
 ///
 /// Asks systemd rather than looking for the unit file. A unit that is present
 /// but dead is the one state the GUI must not mistake for "something else is
 /// handling this" — it would stop applying and leave nothing applying.
-pub fn is_active() -> bool {
-    std::process::Command::new("systemctl")
+///
+/// The answer is tri-state on purpose. `activating`, `deactivating` and
+/// `reloading` are real systemd states that a restart passes through, and a
+/// D-Bus round-trip can fail for reasons that say nothing about the unit.
+/// Reporting either as "not running" would hand the GUI the manual path for
+/// long enough to run its unlocked Disable, deleting the table a restarting
+/// watcher is about to claim. `None` means "cannot tell"; the caller keeps
+/// what it last knew.
+pub fn is_active() -> Option<bool> {
+    // `systemctl is-active` exits non-zero for everything but `active`, so the
+    // exit status cannot separate "inactive" from "could not ask". Only the
+    // word on stdout can, and only a failure to spawn means there is no word
+    // at all.
+    match std::process::Command::new("systemctl")
         .args(["is-active", UNIT])
         .output()
-        .is_ok_and(|output| {
-            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "active"
-        })
+    {
+        Ok(output) => parse_is_active(&String::from_utf8_lossy(&output.stdout)),
+        // No systemctl at all means there is no unit that could be active —
+        // a development machine or a container. The manual path is the only
+        // one that exists there, so offer it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        // systemctl exists but could not be run: cannot tell, keep the last
+        // known answer rather than flipping to the manual path.
+        Err(_) => None,
+    }
+}
+
+/// Maps `systemctl is-active` output to a tri-state answer.
+///
+/// Only settled states count: `active` is running, `inactive` and `failed`
+/// are stopped. The transitional states and anything unrecognised — including
+/// empty output — are `None`, because acting on them would mistake a restart
+/// for a removal.
+fn parse_is_active(stdout: &str) -> Option<bool> {
+    match stdout.trim() {
+        "active" => Some(true),
+        "inactive" | "failed" => Some(false),
+        _ => None,
+    }
 }
 
 /// Reads what the service last published, if it has.
@@ -129,6 +159,12 @@ impl Lock {
     }
 }
 
+/// A successful rule change, before the shared bookkeeping is committed.
+enum Settled {
+    Applied(ScopedCgroup, BTreeSet<IpNet>, String),
+    Removed,
+}
+
 /// Runs the watcher until the process is killed.
 pub fn run(config_path: &Path) -> Result<()> {
     let _lock = Lock::acquire()?;
@@ -137,6 +173,10 @@ pub fn run(config_path: &Path) -> Result<()> {
     // Assume the table is absent until told otherwise. Guessing "present" would
     // make the first poll skip an apply that is actually needed.
     let mut table_present = firewall::table_present().unwrap_or(false);
+    // A table already in place was not applied by this process, so its scope is
+    // unknown. Recording it lets the normal decision table reconcile it: it is
+    // adopted if the game is running, and removed after the grace period if not.
+    watcher.note_table_present(table_present);
     let mut last_heartbeat = Instant::now();
     let mut since = epoch_secs();
 
@@ -151,28 +191,32 @@ pub fn run(config_path: &Path) -> Result<()> {
     let mut last_config_error: Option<String> = None;
 
     println!("watching for Overwatch; config {}", config_path.display());
-    publish_state(None, 0, "starting", since)?;
+    publish(&mut last_error, None, table_present, 0, "starting", since);
 
     loop {
-        let (enabled, networks, revision) = match service_config::load_from(config_path) {
+        let (config, revision) = match service_config::load_from(config_path) {
             Ok(config) => {
                 if last_config_error.take().is_some() {
                     println!("service config is readable again");
                 }
-                (config.enabled, config.networks(), config.revision)
+                let facts = ConfigFacts {
+                    enabled: config.enabled,
+                    networks: config.networks(),
+                };
+                (Some(facts), config.revision)
             }
             Err(error) => {
                 // A config that cannot be read is "no instruction", never
                 // "disable". It is most likely mid-write, or left empty by a
                 // failed catalogue fetch, and taking live rules down over that
-                // would punch a hole exactly when the user is playing. The
-                // empty selection below is what makes the watcher inert.
+                // would punch a hole exactly when the user is playing. Passing
+                // `None` below is what makes the watcher inert for this poll.
                 let message = format!("{error:#}");
                 if last_config_error.as_deref() != Some(message.as_str()) {
                     println!("ignoring service config: {message}");
                     last_config_error = Some(message);
                 }
-                (false, Vec::new(), 0)
+                (None, 0)
             }
         };
 
@@ -181,92 +225,144 @@ pub fn run(config_path: &Path) -> Result<()> {
         let game = steam::running_game_cgroup().map(|cgroup| ScopedCgroup::of(&cgroup));
         let observation = Observation {
             game,
-            enabled,
-            networks,
+            config,
             table_present,
         };
 
         let decision = watcher.step(&observation, Instant::now());
 
-        match &decision {
-            Decision::Apply(plan) => match firewall::apply(plan) {
-                Ok(()) => {
-                    // Read the identity *after* the rules are up, so what is
-                    // recorded is the cgroup object nft has just bound them to.
-                    let scoped = ScopedCgroup::of(&plan.cgroup);
-                    report(
-                        &mut last_error,
-                        format!(
-                            "applied {} blocks scoped to {} (cgroup {})",
-                            plan.ipv4.len() + plan.ipv6.len(),
-                            plan.cgroup.path,
-                            describe_inode(scoped.inode),
-                        ),
+        // Do the I/O first, then commit the result through one path. The two
+        // transitions used to repeat the bookkeeping, and one of them had the
+        // report before the state update while the other had it after.
+        let outcome: Result<Option<Settled>, String> = match &decision {
+            Decision::Apply(plan) => firewall::apply(plan)
+                .map(|scoped| {
+                    // Record the plan that was actually installed, not a fresh
+                    // read of the config: that is what the next poll compares
+                    // against to notice a changed selection.
+                    let networks = plan.ipv4.iter().chain(&plan.ipv6).copied().collect();
+                    let line = format!(
+                        "applied {} blocks scoped to {} (cgroup {})",
+                        plan.ipv4.len() + plan.ipv6.len(),
+                        plan.cgroup.path,
+                        describe_inode(scoped.inode),
                     );
-                    watcher.applied(scoped);
-                    table_present = true;
-                    since = epoch_secs();
-                    publish_state(watcher.current().cloned(), revision, "apply", since)?;
-                }
-                Err(error) => note(&mut last_error, format!("could not apply blocks: {error:#}")),
-            },
-            Decision::Disable => match firewall::disable() {
-                Ok(()) => {
-                    watcher.removed();
-                    table_present = false;
-                    since = epoch_secs();
-                    report(&mut last_error, "removed blocks".to_owned());
-                    publish_state(None, revision, "disable", since)?;
-                }
-                Err(error) => note(
+                    Some(Settled::Applied(scoped, networks, line))
+                })
+                .map_err(|error| format!("could not apply blocks: {error:#}")),
+            Decision::Disable => firewall::disable()
+                .map(|()| Some(Settled::Removed))
+                .map_err(|error| format!("could not remove blocks: {error:#}")),
+            Decision::Idle => Ok(None),
+        };
+
+        match outcome {
+            Ok(Some(settled)) => {
+                let (applied, installed, last_decision, line) = match settled {
+                    Settled::Applied(scoped, networks, line) => {
+                        watcher.applied(scoped, networks);
+                        (watcher.current().cloned(), true, "apply", line)
+                    }
+                    Settled::Removed => {
+                        watcher.removed();
+                        (None, false, "disable", "removed blocks".to_owned())
+                    }
+                };
+                table_present = installed;
+                since = epoch_secs();
+                report(&mut last_error, line);
+                publish(
                     &mut last_error,
-                    format!("could not remove blocks: {error:#}"),
-                ),
-            },
-            Decision::Idle => {}
+                    applied,
+                    table_present,
+                    revision,
+                    last_decision,
+                    since,
+                );
+            }
+            Ok(None) => {}
+            Err(message) => note(&mut last_error, message),
         }
 
         if last_heartbeat.elapsed() >= HEARTBEAT {
-            if let Ok(present) = firewall::table_present() {
-                table_present = present;
+            match firewall::table_present() {
+                Ok(present) => {
+                    table_present = present;
+                    // A table appearing or disappearing outside our own apply
+                    // or disable changes what the GUI should be told. Only a
+                    // fresh query is allowed to seed `Unknown`.
+                    if watcher.note_table_present(present) {
+                        since = epoch_secs();
+                        publish(
+                            &mut last_error,
+                            watcher.current().cloned(),
+                            table_present,
+                            revision,
+                            "observed",
+                            since,
+                        );
+                    }
+                }
+                Err(error) => note(
+                    &mut last_error,
+                    format!("could not check the Dropship table: {error:#}"),
+                ),
             }
             last_heartbeat = Instant::now();
         }
 
-        let interval = if observation.game.is_some() || watcher.is_tracking() {
-            ACTIVE_INTERVAL
-        } else {
-            IDLE_INTERVAL
-        };
-        sleep(interval);
+        sleep(watcher.next_poll(observation.config.is_some(), observation.game.is_some()));
+    }
+}
+
+/// Publishes the state, reporting a failure rather than dying over it.
+///
+/// The state file is a diagnostic for the GUI; the firewall works without it.
+/// Treating a full `/run` as fatal would make the daemon exit, `ExecStopPost`
+/// remove the rules, systemd restart it, and repeat — flapping blocks over a
+/// write that does not affect them.
+fn publish(
+    last_error: &mut Option<String>,
+    applied: Option<ScopedCgroup>,
+    table_present: bool,
+    revision: u64,
+    last_decision: &str,
+    since_unix_secs: u64,
+) {
+    if let Err(error) = publish_state(
+        applied,
+        table_present,
+        revision,
+        last_decision,
+        since_unix_secs,
+    ) {
+        note(
+            last_error,
+            format!("could not publish service state: {error:#}"),
+        );
     }
 }
 
 /// Writes the state file the GUI reads.
 ///
-/// Written with a rename so a reader never sees a partial file. Left
+/// Written atomically, so a reader never sees a partial file. Left
 /// world-readable on purpose: the point is for the unprivileged GUI to read it.
 fn publish_state(
     applied: Option<ScopedCgroup>,
+    table_present: bool,
     revision: u64,
     last_decision: &str,
     since_unix_secs: u64,
 ) -> Result<()> {
     let state = PublishedState {
         applied,
+        table_present,
         revision,
         last_decision: last_decision.to_owned(),
         since_unix_secs,
     };
-    let directory = Path::new(RUNTIME_DIR);
-    fs::create_dir_all(directory)?;
-    let path = directory.join("state.json");
-    let temporary = directory.join("state.json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(&state)?)
-        .with_context(|| format!("could not write {}", temporary.display()))?;
-    fs::rename(&temporary, &path)
-        .with_context(|| format!("could not publish {}", path.display()))?;
-    Ok(())
+    let path = Path::new(RUNTIME_DIR).join("state.json");
+    fsutil::write_json_atomic(&path, &state)
 }
 
 /// Prints a state transition, unconditionally.
@@ -312,6 +408,33 @@ mod tests {
     use crate::firewall::CgroupMatch;
 
     #[test]
+    fn a_settled_systemd_state_becomes_an_answer() {
+        assert_eq!(parse_is_active("active\n"), Some(true));
+        assert_eq!(parse_is_active("inactive\n"), Some(false));
+        assert_eq!(parse_is_active("failed\n"), Some(false));
+    }
+
+    #[test]
+    fn a_transitional_systemd_state_is_unknown() {
+        // A `systemctl restart` passes through these. Reading one as "not
+        // running" would flip the GUI into the manual path, whose Disable can
+        // delete the table the restarted watcher is about to re-create.
+        for state in ["activating\n", "deactivating\n", "reloading\n"] {
+            assert_eq!(parse_is_active(state), None, "parsed {state:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_answer_is_unknown() {
+        // `unknown` is what systemd prints for a unit it cannot identify; the
+        // empty case is a systemctl that gave no answer at all. Anything else
+        // unrecognised is treated the same way rather than guessed at.
+        for output in ["unknown\n", "", "   ", "Active\n", "active extra\n"] {
+            assert_eq!(parse_is_active(output), None, "parsed {output:?}");
+        }
+    }
+
+    #[test]
     fn a_second_lock_cannot_be_taken() {
         // The guard against two watchers racing for one table.
         let directory = std::env::temp_dir().join(format!(
@@ -355,6 +478,7 @@ mod tests {
         };
         let state = PublishedState {
             applied: Some(scoped.clone()),
+            table_present: true,
             revision: 12,
             last_decision: "apply".to_owned(),
             since_unix_secs: 1_790_000_000,
@@ -362,6 +486,7 @@ mod tests {
 
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["applied"]["inode"], 31_422);
+        assert_eq!(json["table_present"], true);
         assert_eq!(json["revision"], 12);
         assert_eq!(json["last_decision"], "apply");
 
@@ -376,6 +501,7 @@ mod tests {
         // missing key would collapse those two.
         let state = PublishedState {
             applied: None,
+            table_present: false,
             revision: 0,
             last_decision: "disable".to_owned(),
             since_unix_secs: 0,
@@ -383,5 +509,18 @@ mod tests {
         let json = serde_json::to_value(&state).unwrap();
         assert!(json["applied"].is_null());
         assert!(json.get("applied").is_some());
+        assert_eq!(json["table_present"], false);
+    }
+
+    #[test]
+    fn a_legacy_state_without_table_present_still_parses() {
+        // The field arrived after the first releases. A state file left behind
+        // in /run across an upgrade must still parse, as "no table".
+        let state: PublishedState = serde_json::from_str(
+            r#"{"applied":null,"revision":3,"last_decision":"disable","since_unix_secs":7}"#,
+        )
+        .unwrap();
+        assert!(state.applied.is_none());
+        assert!(!state.table_present);
     }
 }
